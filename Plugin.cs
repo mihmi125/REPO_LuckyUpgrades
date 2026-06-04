@@ -18,24 +18,22 @@ public class Plugin : BaseUnityPlugin
     public static Plugin Instance { get; private set; }
     public static UpgradeConfig UpgradeConfiguration { get; private set; }
 
-    // Use int with Interlocked for thread-safe flag (0 = false, 1 = true)
+    // Thread-safe re-entrancy guard (0 = not applying, 1 = applying)
     private static int _isApplyingSharedUpgrade = 0;
 
-    // Lock object for thread-safe Random access
     private static readonly object _randomLock = new object();
     private static readonly System.Random _random = new System.Random();
 
     internal static string _mySteamID = null;
 
-    // Dictionary to track shared upgrades for reapplication
+    // Tracks shared upgrades for reapplication on level transition
     internal static readonly Dictionary<string, int> _sharedUpgrades = new Dictionary<string, int>();
 
     // Registry for modded upgrades registered by other mods
-    // Key: upgradeId, Value: (applyAction, shareChance)
     internal static readonly Dictionary<string, (Action<string, int> apply, int chance)> _moddedUpgradeRegistry
         = new Dictionary<string, (Action<string, int>, int)>();
 
-    private Harmony harmony;
+    private Harmony _harmony;
 
     private void Awake()
     {
@@ -45,10 +43,9 @@ public class Plugin : BaseUnityPlugin
 
         UpgradeConfiguration = new UpgradeConfig(Config);
 
-        harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
-        harmony.PatchAll(typeof(Plugin));
+        _harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
+        _harmony.PatchAll(typeof(Plugin));
 
-        // Create a separate GameObject for the Update loop
         var updateRunner = new GameObject("LuckyUpgrades_UpdateRunner");
         updateRunner.AddComponent<UpgradeReapplyRunner>();
         UnityEngine.Object.DontDestroyOnLoad(updateRunner);
@@ -57,9 +54,9 @@ public class Plugin : BaseUnityPlugin
         Logger.LogInfo("Harmony patches applied!");
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // Public API for other mods
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
     /// <summary>
     /// Register a custom upgrade from another mod so LuckyUpgrades can share it.
@@ -72,9 +69,6 @@ public class Plugin : BaseUnityPlugin
     ///       shareChance: 30
     ///   );
     /// </summary>
-    /// <param name="upgradeId">Unique string ID for the upgrade (e.g. "MyMod_NightVision")</param>
-    /// <param name="applyAction">Action that applies `amount` stacks of the upgrade to the given steamID</param>
-    /// <param name="shareChance">0-100 chance to share. Defaults to 25.</param>
     public static void RegisterModdedUpgrade(
         string upgradeId,
         Action<string, int> applyAction,
@@ -90,15 +84,12 @@ public class Plugin : BaseUnityPlugin
             Logger?.LogError($"[LuckyUpgrades] RegisterModdedUpgrade: applyAction cannot be null (upgradeId: {upgradeId}).");
             return;
         }
+
         shareChance = Math.Max(0, Math.Min(100, shareChance));
 
         if (_moddedUpgradeRegistry.ContainsKey(upgradeId))
-        {
             Logger?.LogWarning($"[LuckyUpgrades] Upgrade '{upgradeId}' already registered — overwriting.");
-        }
 
-        // Create a config entry so players can adjust this upgrade's chance in the .cfg file.
-        // The entry lives under [ModdedUpgrades] with the upgradeId as the key.
         var configEntry = UpgradeConfiguration?.BindModdedUpgrade(upgradeId, shareChance);
         int resolvedChance = configEntry?.Value ?? shareChance;
 
@@ -107,15 +98,11 @@ public class Plugin : BaseUnityPlugin
     }
 
     /// <summary>
-    /// Call this from your mod when a player picks up your custom upgrade,
-    /// so LuckyUpgrades can roll to share it with other players.
+    /// Call this from your mod when a player picks up your custom upgrade.
     ///
     /// Example:
     ///   Plugin.TriggerModdedUpgradeShare("MyMod_NightVision", pickerSteamID, amount: 1);
     /// </summary>
-    /// <param name="upgradeId">The ID you used in RegisterModdedUpgrade</param>
-    /// <param name="sourceSteamID">SteamID of the player who picked up the upgrade</param>
-    /// <param name="amount">How many stacks were applied (usually 1)</param>
     public static void TriggerModdedUpgradeShare(string upgradeId, string sourceSteamID, int amount = 1)
     {
         if (!_moddedUpgradeRegistry.TryGetValue(upgradeId, out var entry))
@@ -131,34 +118,24 @@ public class Plugin : BaseUnityPlugin
                 if (!string.IsNullOrEmpty(myID))
                     entry.apply(myID, amt);
             },
-            chanceOverride: entry.chance
-        );
+            chanceOverride: entry.chance);
     }
 
-    // -------------------------------------------------------------------------
+    // =========================================================================
     // Internal helpers
-    // -------------------------------------------------------------------------
+    // =========================================================================
 
-    /// <summary>
-    /// Gets the local player's SteamID. Cached after first successful lookup.
-    /// </summary>
     internal static string GetMySteamID()
     {
         if (string.IsNullOrEmpty(_mySteamID))
         {
             var localPlayer = SemiFunc.PlayerAvatarLocal();
             if (localPlayer != null)
-            {
                 _mySteamID = SemiFunc.PlayerGetSteamID(localPlayer);
-            }
         }
         return _mySteamID;
     }
 
-    /// <summary>
-    /// Reapplies all tracked shared upgrades (both built-in and modded).
-    /// Called after a level transition for non-host players.
-    /// </summary>
     internal static void ReapplySharedUpgrades()
     {
         if (_sharedUpgrades.Count == 0) return;
@@ -198,69 +175,50 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    /// <summary>
-    /// Applies a single upgrade type to the given player.
-    /// Returns true if the upgrade type was recognised and applied.
-    /// </summary>
     private static bool ReapplySingleUpgrade(string myID, string upgradeType, int amount)
     {
         switch (upgradeType)
         {
             case "Health":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerHealth(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerHealth(myID, 1);
                 return true;
             case "Energy":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerEnergy(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerEnergy(myID, 1);
                 return true;
             case "ExtraJump":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerExtraJump(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerExtraJump(myID, 1);
                 return true;
             case "GrabRange":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerGrabRange(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerGrabRange(myID, 1);
                 return true;
             case "GrabStrength":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerGrabStrength(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerGrabStrength(myID, 1);
                 return true;
             case "GrabThrow":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerThrowStrength(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerThrowStrength(myID, 1);
                 return true;
             case "SprintSpeed":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerSprintSpeed(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerSprintSpeed(myID, 1);
                 return true;
             case "TumbleLaunch":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerTumbleLaunch(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerTumbleLaunch(myID, 1);
                 return true;
             case "MapPlayerCount":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradeMapPlayerCount(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradeMapPlayerCount(myID, 1);
                 return true;
             case "TumbleClimb":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerTumbleClimb(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerTumbleClimb(myID, 1);
                 return true;
             case "TumbleWings":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerTumbleWings(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerTumbleWings(myID, 1);
                 return true;
             case "CrouchRest":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradePlayerCrouchRest(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerCrouchRest(myID, 1);
                 return true;
             case "DeathHeadBattery":
-                for (int i = 0; i < amount; i++)
-                    PunManager.instance.UpgradeDeathHeadBattery(myID, 1);
+                for (int i = 0; i < amount; i++) PunManager.instance.UpgradeDeathHeadBattery(myID, 1);
                 return true;
-
             default:
-                // Try modded upgrade registry
                 if (_moddedUpgradeRegistry.TryGetValue(upgradeType, out var moddedEntry))
                 {
                     moddedEntry.apply(myID, amount);
@@ -270,9 +228,6 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    /// <summary>
-    /// Tracks a shared upgrade for later reapplication on level transition.
-    /// </summary>
     private static void TrackSharedUpgrade(string upgradeType, int amount)
     {
         if (!_sharedUpgrades.TryGetValue(upgradeType, out int current))
@@ -281,121 +236,143 @@ public class Plugin : BaseUnityPlugin
         Logger.LogInfo($"[LuckyUpgrades] Tracked: {upgradeType} (total: {_sharedUpgrades[upgradeType]})");
     }
 
-    // -------------------------------------------------------------------------
-    // Harmony patches — built-in upgrades
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // Harmony patch — single patch on ItemUpgrade.PlayUpgrade()
+    //
+    // WHY: PunManager.Upgrade* only runs on the host. ItemUpgrade.PlayUpgrade()
+    // fires on EVERY client when an upgrade is used, so we intercept here instead.
+    // We map the component type on the GameObject to our internal upgrade key.
+    // =========================================================================
 
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerHealth")]
+    [HarmonyPatch(typeof(ItemUpgrade), "PlayUpgrade")]
     [HarmonyPostfix]
-    public static void UpgradePlayerHealth_Postfix(string _steamID, int value)
+    public static void ItemUpgrade_PlayUpgrade_Postfix(ItemUpgrade __instance)
     {
-        ApplySharedUpgradeToSelf("Health", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerHealth(GetMySteamID(), amount));
-    }
+        try
+        {
+            // Skip if we triggered this call ourselves
+            if (Interlocked.CompareExchange(ref _isApplyingSharedUpgrade, 0, 0) == 1) return;
 
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerEnergy")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerEnergy_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("Energy", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerEnergy(GetMySteamID(), amount));
-    }
+            string mySteamID = GetMySteamID();
 
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerExtraJump")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerExtraJump_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("ExtraJump", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerExtraJump(GetMySteamID(), amount));
-    }
+            // Identify which upgrade type this is by checking components on the same GameObject
+            string upgradeType = GetUpgradeType(__instance);
+            Logger.LogInfo($"[LuckyUpgrades] DEBUG PlayUpgrade fired: type='{upgradeType}' mySteamID='{mySteamID}'");
 
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerGrabRange")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerGrabRange_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("GrabRange", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerGrabRange(GetMySteamID(), amount));
-    }
+            if (string.IsNullOrEmpty(upgradeType)) return;
 
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerGrabStrength")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerGrabStrength_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("GrabStrength", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerGrabStrength(GetMySteamID(), amount));
-    }
+            // Get the SteamID of the player who used this item
+            string sourceSteamID = GetSteamIDFromItem(__instance);
+            Logger.LogInfo($"[LuckyUpgrades] DEBUG sourceSteamID='{sourceSteamID}'");
 
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerThrowStrength")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerThrowStrength_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("GrabThrow", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerThrowStrength(GetMySteamID(), amount));
-    }
+            if (string.IsNullOrEmpty(sourceSteamID)) return;
+            if (string.IsNullOrEmpty(mySteamID)) return;
 
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerSprintSpeed")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerSprintSpeed_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("SprintSpeed", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerSprintSpeed(GetMySteamID(), amount));
-    }
+            // Only react to OTHER players' upgrades
+            if (mySteamID == sourceSteamID) return;
 
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerTumbleLaunch")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerTumbleLaunch_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("TumbleLaunch", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerTumbleLaunch(GetMySteamID(), amount));
+            ApplySharedUpgradeToSelf(upgradeType, sourceSteamID, 1,
+                applyToSelf: (_) =>
+                {
+                    string myID = GetMySteamID();
+                    if (!string.IsNullOrEmpty(myID))
+                        ApplyUpgradeByType(upgradeType, myID);
+                });
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError($"[LuckyUpgrades] Error in ItemUpgrade_PlayUpgrade_Postfix: {ex.Message}");
+        }
     }
-
-    [HarmonyPatch(typeof(PunManager), "UpgradeMapPlayerCount")]
-    [HarmonyPostfix]
-    public static void UpgradeMapPlayerCount_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("MapPlayerCount", _steamID, value,
-            (amount) => PunManager.instance.UpgradeMapPlayerCount(GetMySteamID(), amount));
-    }
-
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerTumbleClimb")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerTumbleClimb_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("TumbleClimb", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerTumbleClimb(GetMySteamID(), amount));
-    }
-
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerTumbleWings")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerTumbleWings_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("TumbleWings", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerTumbleWings(GetMySteamID(), amount));
-    }
-
-    [HarmonyPatch(typeof(PunManager), "UpgradePlayerCrouchRest")]
-    [HarmonyPostfix]
-    public static void UpgradePlayerCrouchRest_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("CrouchRest", _steamID, value,
-            (amount) => PunManager.instance.UpgradePlayerCrouchRest(GetMySteamID(), amount));
-    }
-
-    [HarmonyPatch(typeof(PunManager), "UpgradeDeathHeadBattery")]
-    [HarmonyPostfix]
-    public static void UpgradeDeathHeadBattery_Postfix(string _steamID, int value)
-    {
-        ApplySharedUpgradeToSelf("DeathHeadBattery", _steamID, value,
-            (amount) => PunManager.instance.UpgradeDeathHeadBattery(GetMySteamID(), amount));
-    }
-
-    // -------------------------------------------------------------------------
-    // Core sharing logic
-    // -------------------------------------------------------------------------
 
     /// <summary>
-    /// When another player gets an upgrade, roll to apply it to ourselves.
-    /// chanceOverride: if provided, skips the config lookup (used for modded upgrades).
+    /// Maps the concrete component type on the GameObject to our internal upgrade key string.
+    /// Returns null if the type is not a recognised player upgrade.
+    /// </summary>
+    private static string GetUpgradeType(ItemUpgrade item)
+    {
+        var go = item.gameObject;
+        if      (go.GetComponent<ItemUpgradePlayerHealth>()      != null) return "Health";
+        else if (go.GetComponent<ItemUpgradePlayerEnergy>()      != null) return "Energy";
+        else if (go.GetComponent<ItemUpgradePlayerExtraJump>()   != null) return "ExtraJump";
+        else if (go.GetComponent<ItemUpgradePlayerGrabRange>()   != null) return "GrabRange";
+        else if (go.GetComponent<ItemUpgradePlayerGrabStrength>()!= null) return "GrabStrength";
+        else if (go.GetComponent<ItemUpgradePlayerGrabThrow>()   != null) return "GrabThrow";
+        else if (go.GetComponent<ItemUpgradePlayerSprintSpeed>() != null) return "SprintSpeed";
+        else if (go.GetComponent<ItemUpgradePlayerTumbleLaunch>()!= null) return "TumbleLaunch";
+        else if (go.GetComponent<ItemUpgradePlayerTumbleClimb>() != null) return "TumbleClimb";
+        else if (go.GetComponent<ItemUpgradePlayerTumbleWings>() != null) return "TumbleWings";
+        else if (go.GetComponent<ItemUpgradePlayerCrouchRest>()  != null) return "CrouchRest";
+        else if (go.GetComponent<ItemUpgradeDeathHeadBattery>()  != null) return "DeathHeadBattery";
+        else if (go.GetComponent<ItemUpgradeMapPlayerCount>()    != null) return "MapPlayerCount";
+        return null;
+    }
+
+    /// <summary>
+    /// Applies one stack of the named upgrade to the given player via PunManager.
+    /// </summary>
+    private static void ApplyUpgradeByType(string upgradeType, string steamID)
+    {
+        switch (upgradeType)
+        {
+            case "Health":         PunManager.instance.UpgradePlayerHealth(steamID, 1);       break;
+            case "Energy":         PunManager.instance.UpgradePlayerEnergy(steamID, 1);       break;
+            case "ExtraJump":      PunManager.instance.UpgradePlayerExtraJump(steamID, 1);    break;
+            case "GrabRange":      PunManager.instance.UpgradePlayerGrabRange(steamID, 1);    break;
+            case "GrabStrength":   PunManager.instance.UpgradePlayerGrabStrength(steamID, 1); break;
+            case "GrabThrow":      PunManager.instance.UpgradePlayerThrowStrength(steamID, 1);break;
+            case "SprintSpeed":    PunManager.instance.UpgradePlayerSprintSpeed(steamID, 1);  break;
+            case "TumbleLaunch":   PunManager.instance.UpgradePlayerTumbleLaunch(steamID, 1); break;
+            case "MapPlayerCount": PunManager.instance.UpgradeMapPlayerCount(steamID, 1);     break;
+            case "TumbleClimb":    PunManager.instance.UpgradePlayerTumbleClimb(steamID, 1);  break;
+            case "TumbleWings":    PunManager.instance.UpgradePlayerTumbleWings(steamID, 1);  break;
+            case "CrouchRest":     PunManager.instance.UpgradePlayerCrouchRest(steamID, 1);   break;
+            case "DeathHeadBattery": PunManager.instance.UpgradeDeathHeadBattery(steamID, 1); break;
+        }
+    }
+
+    /// <summary>
+    /// Tries to get the SteamID of the player who used the upgrade item.
+    /// Checks direct playerAvatar field first, then falls back to grabbing player.
+    /// </summary>
+    private static string GetSteamIDFromItem(ItemUpgrade item)
+    {
+        if (item == null) return null;
+
+        try
+        {
+            // Try direct playerAvatar field via reflection
+            var avatarField = item.GetType().GetField("playerAvatar",
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance);
+
+            if (avatarField != null)
+            {
+                var avatar = avatarField.GetValue(item) as PlayerAvatar;
+                if (avatar != null)
+                    return SemiFunc.PlayerGetSteamID(avatar);
+            }
+
+            // Fallback: find who is physically grabbing the item
+            var physObj = item.GetComponent<PhysGrabObject>();
+            if (physObj != null)
+            {
+                var grabbers = SemiFunc.PhysGrabObjectGetPlayerAvatarsGrabbing(physObj);
+                if (grabbers != null && grabbers.Count > 0)
+                    return SemiFunc.PlayerGetSteamID(grabbers[0]);
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning($"[LuckyUpgrades] GetSteamIDFromItem failed: {ex.Message}");
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Rolls the share chance and applies the upgrade to the local player if successful.
     /// </summary>
     private static void ApplySharedUpgradeToSelf(
         string upgradeType,
@@ -406,15 +383,6 @@ public class Plugin : BaseUnityPlugin
     {
         try
         {
-            // Re-entrant guard: skip if we triggered this call ourselves
-            if (Interlocked.CompareExchange(ref _isApplyingSharedUpgrade, 0, 0) == 1) return;
-
-            string mySteamID = GetMySteamID();
-            if (string.IsNullOrEmpty(mySteamID)) return;
-
-            // Only react to OTHER players' upgrades
-            if (mySteamID == sourceSteamID) return;
-
             int shareChance = chanceOverride ?? UpgradeConfiguration.GetShareChance(upgradeType);
 
             int roll;
@@ -485,7 +453,6 @@ public class UpgradeReapplyRunner : MonoBehaviour
             Plugin.Logger.LogInfo($"[LuckyUpgrades] Level changed: {_lastLevelName} -> {currentLevel}");
             _lastLevelName = currentLevel;
 
-            // Returning to main menu or lobby — clear all session data
             if (SESSION_END_LEVELS.Contains(currentLevel))
             {
                 Plugin._sharedUpgrades.Clear();
@@ -494,7 +461,6 @@ public class UpgradeReapplyRunner : MonoBehaviour
                 return;
             }
 
-            // Entering a game level — schedule reapplication for non-host players
             if (Plugin._sharedUpgrades.Count > 0)
             {
                 _pendingReapply = true;
@@ -510,10 +476,6 @@ public class UpgradeReapplyRunner : MonoBehaviour
             {
                 _pendingReapply = false;
 
-                // Host: built-in upgrades persist automatically via Photon, but any
-                // upgrades the host RECEIVED as a share still need to be reapplied.
-                // We skip only if the host has no tracked shared upgrades (i.e. they
-                // were always the source, never the recipient).
                 if (PhotonNetwork.IsMasterClient && Plugin._sharedUpgrades.Count == 0)
                 {
                     Plugin.Logger.LogInfo("[LuckyUpgrades] Host with no received upgrades — skipping reapply.");
