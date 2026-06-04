@@ -373,6 +373,7 @@ public class Plugin : BaseUnityPlugin
 
     /// <summary>
     /// Rolls the share chance and applies the upgrade to the local player if successful.
+    /// FIXED: Now handles 100% probability and edge cases correctly.
     /// </summary>
     private static void ApplySharedUpgradeToSelf(
         string upgradeType,
@@ -385,6 +386,31 @@ public class Plugin : BaseUnityPlugin
         {
             int shareChance = chanceOverride ?? UpgradeConfiguration.GetShareChance(upgradeType);
 
+            // CRITICAL FIX: Handle 100% probability and edge cases properly
+            if (shareChance <= 0)
+            {
+                Logger.LogInfo($"[LuckyUpgrades] Shared upgrade skipped: {upgradeType} (0% chance) ✗");
+                return;
+            }
+
+            // If chance is 100%, always apply without RNG
+            if (shareChance >= 100)
+            {
+                try
+                {
+                    Interlocked.Exchange(ref _isApplyingSharedUpgrade, 1);
+                    applyToSelf(amount);
+                    TrackSharedUpgrade(upgradeType, amount);
+                    Logger.LogInfo($"[LuckyUpgrades] Shared upgrade applied: {upgradeType} +{amount} (100% guaranteed) ✓");
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _isApplyingSharedUpgrade, 0);
+                }
+                return;
+            }
+
+            // For normal probabilistic roll (0-99% range)
             int roll;
             lock (_randomLock)
             {
