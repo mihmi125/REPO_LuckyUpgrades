@@ -101,7 +101,7 @@ public class Plugin : BaseUnityPlugin
             int resolvedChance = configEntry?.Value ?? shareChance;
 
             _moddedUpgradeRegistry[upgradeId] = (applyAction, resolvedChance);
-            Logger?.LogInfo($"[LuckyUpgrades] Registered modded upgrade: '{upgradeId}' ({resolvedChance}% share chance)");
+            Logger?.LogInfo($"[LuckyUpgrades] ✓ REGISTERED modded upgrade: '{upgradeId}' ({resolvedChance}% share chance)");
         }
     }
 
@@ -119,17 +119,26 @@ public class Plugin : BaseUnityPlugin
         {
             if (!_moddedUpgradeRegistry.TryGetValue(upgradeId, out entry))
             {
-                Logger?.LogWarning($"[LuckyUpgrades] TriggerModdedUpgradeShare: '{upgradeId}' is not registered. Call RegisterModdedUpgrade first.");
+                Logger?.LogError($"[LuckyUpgrades] ✗ TriggerModdedUpgradeShare: '{upgradeId}' NOT REGISTERED! Did you call RegisterModdedUpgrade()?");
                 return;
             }
         }
 
+        Logger?.LogInfo($"[LuckyUpgrades] → TriggerModdedUpgradeShare called: '{upgradeId}' from {sourceSteamID}");
+        
         ApplySharedUpgradeToSelf(upgradeId, sourceSteamID, amount,
             applyToSelf: (amt) =>
             {
                 string myID = GetMySteamID();
                 if (!string.IsNullOrEmpty(myID))
+                {
+                    Logger?.LogInfo($"[LuckyUpgrades] → Applying modded upgrade '{upgradeId}' to player {myID} (+{amt})");
                     entry.apply(myID, amt);
+                }
+                else
+                {
+                    Logger?.LogWarning($"[LuckyUpgrades] ✗ Cannot apply '{upgradeId}': SteamID is null/empty");
+                }
             },
             chanceOverride: entry.chance);
     }
@@ -149,9 +158,9 @@ public class Plugin : BaseUnityPlugin
                 {
                     _mySteamID = SemiFunc.PlayerGetSteamID(localPlayer);
                     if (!string.IsNullOrEmpty(_mySteamID))
-                        Logger?.LogInfo($"[LuckyUpgrades] Player SteamID cached: {_mySteamID}");
+                        Logger?.LogDebug($"[LuckyUpgrades] Player SteamID cached: {_mySteamID}");
                     else
-                        Logger?.LogWarning("[LuckyUpgrades] Failed to get player SteamID");
+                        Logger?.LogWarning("[LuckyUpgrades] Failed to get player SteamID from local player");
                 }
                 else
                 {
@@ -296,13 +305,13 @@ public class Plugin : BaseUnityPlugin
 
             // Identify which upgrade type this is by checking components on the same GameObject
             string upgradeType = GetUpgradeType(__instance);
-            Logger.LogInfo($"[LuckyUpgrades] DEBUG PlayUpgrade fired: type='{upgradeType}' mySteamID='{mySteamID}'");
+            Logger.LogDebug($"[LuckyUpgrades] DEBUG PlayUpgrade fired: type='{upgradeType}' mySteamID='{mySteamID}'");
 
             if (string.IsNullOrEmpty(upgradeType)) return;
 
             // Get the SteamID of the player who used this item
             string sourceSteamID = GetSteamIDFromItem(__instance);
-            Logger.LogInfo($"[LuckyUpgrades] DEBUG sourceSteamID='{sourceSteamID}'");
+            Logger.LogDebug($"[LuckyUpgrades] DEBUG sourceSteamID='{sourceSteamID}'");
 
             if (string.IsNullOrEmpty(sourceSteamID)) return;
             if (string.IsNullOrEmpty(mySteamID)) return;
@@ -477,7 +486,7 @@ public class Plugin : BaseUnityPlugin
         }
         catch (Exception ex)
         {
-            Logger.LogError($"[LuckyUpgrades] Error in ApplySharedUpgradeToSelf: {ex.Message}");
+            Logger.LogError($"[LuckyUpgrades] Error in ApplySharedUpgradeToSelf: {ex.Message}\n{ex.StackTrace}");
         }
     }
 }
