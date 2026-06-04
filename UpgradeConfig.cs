@@ -1,3 +1,4 @@
+using System;
 using BepInEx.Configuration;
 
 namespace LuckyUpgrades
@@ -8,245 +9,187 @@ namespace LuckyUpgrades
     /// </summary>
     public class UpgradeConfig
     {
-        // === Upgrade Chances ===
+        // === Built-in Upgrade Chances ===
 
-        /// <summary>
-        /// Health upgrade share chance.
-        /// </summary>
+        /// <summary>Health upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerHealth { get; private set; }
 
-        /// <summary>
-        /// Energy (Stamina) upgrade share chance.
-        /// </summary>
+        /// <summary>Energy (Stamina) upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerEnergy { get; private set; }
 
-        /// <summary>
-        /// Sprint Speed upgrade share chance.
-        /// </summary>
+        /// <summary>Sprint Speed upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerSprintSpeed { get; private set; }
 
-        /// <summary>
-        /// Extra Jump upgrade share chance.
-        /// </summary>
+        /// <summary>Extra Jump upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerExtraJump { get; private set; }
 
-        /// <summary>
-        /// Tumble Launch upgrade share chance.
-        /// </summary>
+        /// <summary>Tumble Launch upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerTumbleLaunch { get; private set; }
 
-        /// <summary>
-        /// Grab Range upgrade share chance.
-        /// </summary>
+        /// <summary>Grab Range upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerGrabRange { get; private set; }
 
-        /// <summary>
-        /// Grab Strength upgrade share chance.
-        /// </summary>
+        /// <summary>Grab Strength upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerGrabStrength { get; private set; }
 
-        /// <summary>
-        /// Grab Throw upgrade share chance.
-        /// </summary>
+        /// <summary>Grab Throw upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerGrabThrow { get; private set; }
 
-        /// <summary>
-        /// Tumble Climb upgrade share chance.
-        /// </summary>
+        /// <summary>Tumble Climb upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerTumbleClimb { get; private set; }
 
-        /// <summary>
-        /// Tumble Wings upgrade share chance.
-        /// </summary>
+        /// <summary>Tumble Wings upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerTumbleWings { get; private set; }
 
-        /// <summary>
-        /// Crouch Rest upgrade share chance.
-        /// </summary>
+        /// <summary>Crouch Rest upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivatePlayerCrouchRest { get; private set; }
 
-        /// <summary>
-        /// Death Head Battery upgrade share chance.
-        /// </summary>
+        /// <summary>Death Head Battery upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivateDeathHeadBattery { get; private set; }
 
-        /// <summary>
-        /// Map Player Count upgrade share chance.
-        /// </summary>
+        /// <summary>Map Player Count upgrade share chance.</summary>
         public ConfigEntry<int> ChanceToActivateMapPlayerCount { get; private set; }
+
+        // === Modded Upgrade Defaults ===
+
+        /// <summary>
+        /// Default share chance used for modded upgrades that don't supply their own shareChance
+        /// in RegisterModdedUpgrade(). Also applied to any unrecognised upgrade type as a safety net.
+        /// </summary>
+        public ConfigEntry<int> DefaultModdedUpgradeChance { get; private set; }
+
+        private readonly ConfigFile _config;
 
         /// <summary>
         /// Initializes the config file and binds all settings.
         /// </summary>
         public UpgradeConfig(ConfigFile config)
         {
-            ChanceToActivatePlayerHealth = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerHealth",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Health upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            _config = config;
 
-            ChanceToActivatePlayerEnergy = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerEnergy",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Energy (Stamina) upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            // Built-in upgrades
+            ChanceToActivatePlayerHealth = Bind("ChanceToActivatePlayerHealth",
+                "% Chance to share the Health upgrade");
 
-            ChanceToActivatePlayerSprintSpeed = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerSprintSpeed",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Sprint Speed upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerEnergy = Bind("ChanceToActivatePlayerEnergy",
+                "% Chance to share the Energy (Stamina) upgrade");
 
-            ChanceToActivatePlayerExtraJump = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerExtraJump",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Extra Jump upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerSprintSpeed = Bind("ChanceToActivatePlayerSprintSpeed",
+                "% Chance to share the Sprint Speed upgrade");
 
-            ChanceToActivatePlayerTumbleLaunch = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerTumbleLaunch",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Tumble Launch upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerExtraJump = Bind("ChanceToActivatePlayerExtraJump",
+                "% Chance to share the Extra Jump upgrade");
 
-            ChanceToActivatePlayerGrabRange = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerGrabRange",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Grab Range upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerTumbleLaunch = Bind("ChanceToActivatePlayerTumbleLaunch",
+                "% Chance to share the Tumble Launch upgrade");
 
-            ChanceToActivatePlayerGrabStrength = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerGrabStrength",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Grab Strength upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerGrabRange = Bind("ChanceToActivatePlayerGrabRange",
+                "% Chance to share the Grab Range upgrade");
 
-            ChanceToActivatePlayerGrabThrow = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerGrabThrow",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Grab Throw upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerGrabStrength = Bind("ChanceToActivatePlayerGrabStrength",
+                "% Chance to share the Grab Strength upgrade");
 
-            ChanceToActivatePlayerTumbleClimb = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerTumbleClimb",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Tumble Climb upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerGrabThrow = Bind("ChanceToActivatePlayerGrabThrow",
+                "% Chance to share the Grab Throw upgrade");
 
-            ChanceToActivatePlayerTumbleWings = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerTumbleWings",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Tumble Wings upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerTumbleClimb = Bind("ChanceToActivatePlayerTumbleClimb",
+                "% Chance to share the Tumble Climb upgrade");
 
-            ChanceToActivatePlayerCrouchRest = config.Bind(
-                "Upgrades",
-                "ChanceToActivatePlayerCrouchRest",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Crouch Rest upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerTumbleWings = Bind("ChanceToActivatePlayerTumbleWings",
+                "% Chance to share the Tumble Wings upgrade");
 
-            ChanceToActivateDeathHeadBattery = config.Bind(
-                "Upgrades",
-                "ChanceToActivateDeathHeadBattery",
-                25,
-                new ConfigDescription(
-                    "% Chance to share the Death Head Battery upgrade",
-                    new AcceptableValueRange<int>(0, 100)
-                )
-            );
+            ChanceToActivatePlayerCrouchRest = Bind("ChanceToActivatePlayerCrouchRest",
+                "% Chance to share the Crouch Rest upgrade");
 
-            ChanceToActivateMapPlayerCount = config.Bind(
-                "Upgrades",
-                "ChanceToActivateMapPlayerCount",
+            ChanceToActivateDeathHeadBattery = Bind("ChanceToActivateDeathHeadBattery",
+                "% Chance to share the Death Head Battery upgrade");
+
+            ChanceToActivateMapPlayerCount = Bind("ChanceToActivateMapPlayerCount",
+                "% Chance to share the Map Player Count upgrade");
+
+            // Modded upgrade fallback
+            DefaultModdedUpgradeChance = config.Bind(
+                "ModdedUpgrades",
+                "DefaultModdedUpgradeChance",
                 25,
                 new ConfigDescription(
-                    "% Chance to share the Map Player Count upgrade",
+                    "Default % chance used for modded upgrades that don't specify their own share chance. " +
+                    "Also used as a fallback for any unrecognised upgrade type.",
                     new AcceptableValueRange<int>(0, 100)
                 )
             );
         }
 
+        // -------------------------------------------------------------------------
+        // Public API
+        // -------------------------------------------------------------------------
+
         /// <summary>
-        /// Gets the share chance for the specified upgrade type.
+        /// Returns the share chance for a built-in upgrade type (matched by its internal key,
+        /// e.g. "Health", "Energy"). Falls back to DefaultModdedUpgradeChance for unknown types.
         /// </summary>
         public int GetShareChance(string upgradeType)
         {
-            string typeLower = upgradeType.ToLower();
+            switch (upgradeType)
+            {
+                case "Health":        return ChanceToActivatePlayerHealth.Value;
+                case "Energy":        return ChanceToActivatePlayerEnergy.Value;
+                case "SprintSpeed":   return ChanceToActivatePlayerSprintSpeed.Value;
+                case "ExtraJump":     return ChanceToActivatePlayerExtraJump.Value;
+                case "TumbleLaunch":  return ChanceToActivatePlayerTumbleLaunch.Value;
+                case "TumbleClimb":   return ChanceToActivatePlayerTumbleClimb.Value;
+                case "TumbleWings":   return ChanceToActivatePlayerTumbleWings.Value;
+                case "CrouchRest":    return ChanceToActivatePlayerCrouchRest.Value;
+                case "GrabRange":     return ChanceToActivatePlayerGrabRange.Value;
+                case "GrabStrength":  return ChanceToActivatePlayerGrabStrength.Value;
+                case "GrabThrow":     return ChanceToActivatePlayerGrabThrow.Value;
+                case "MapPlayerCount":    return ChanceToActivateMapPlayerCount.Value;
+                case "DeathHeadBattery":  return ChanceToActivateDeathHeadBattery.Value;
 
-            if (typeLower.Contains("health"))
-                return ChanceToActivatePlayerHealth.Value;
-            if (typeLower.Contains("energy") || typeLower.Contains("stamina"))
-                return ChanceToActivatePlayerEnergy.Value;
-            if (typeLower.Contains("sprint") || typeLower.Contains("speed"))
-                return ChanceToActivatePlayerSprintSpeed.Value;
-            if (typeLower.Contains("jump"))
-                return ChanceToActivatePlayerExtraJump.Value;
-            if (typeLower.Contains("tumblelaunch") || typeLower.Contains("launch"))
-                return ChanceToActivatePlayerTumbleLaunch.Value;
-            if (typeLower.Contains("tumbleclimb") || typeLower.Contains("climb"))
-                return ChanceToActivatePlayerTumbleClimb.Value;
-            if (typeLower.Contains("tumblewing") || typeLower.Contains("wing"))
-                return ChanceToActivatePlayerTumbleWings.Value;
-            if (typeLower.Contains("crouch") || typeLower.Contains("rest"))
-                return ChanceToActivatePlayerCrouchRest.Value;
-            if (typeLower.Contains("deathhead") || typeLower.Contains("battery"))
-                return ChanceToActivateDeathHeadBattery.Value;
-            if (typeLower.Contains("range"))
-                return ChanceToActivatePlayerGrabRange.Value;
-            if (typeLower.Contains("strength"))
-                return ChanceToActivatePlayerGrabStrength.Value;
-            if (typeLower.Contains("throw"))
-                return ChanceToActivatePlayerGrabThrow.Value;
-            if (typeLower.Contains("map") || typeLower.Contains("count"))
-                return ChanceToActivateMapPlayerCount.Value;
+                default:
+                    // Unknown type — log once and return the configurable default
+                    Plugin.Logger?.LogWarning(
+                        $"[LuckyUpgrades] GetShareChance: unknown upgrade type '{upgradeType}'. " +
+                        $"Using DefaultModdedUpgradeChance ({DefaultModdedUpgradeChance.Value}%).");
+                    return DefaultModdedUpgradeChance.Value;
+            }
+        }
 
-            // Default chance for unknown types
-            return 25;
+        /// <summary>
+        /// Dynamically adds a config entry for a modded upgrade so players can tweak
+        /// its share chance in the cfg file, just like built-in upgrades.
+        /// Returns the bound ConfigEntry so the caller can read it later.
+        ///
+        /// This is called automatically by Plugin.RegisterModdedUpgrade when
+        /// createConfigEntry is true (the default).
+        /// </summary>
+        public ConfigEntry<int> BindModdedUpgrade(string upgradeId, int defaultChance = 25)
+        {
+            defaultChance = Math.Max(0, Math.Min(100, defaultChance));
+
+            return _config.Bind(
+                "ModdedUpgrades",
+                upgradeId,
+                defaultChance,
+                new ConfigDescription(
+                    $"% Chance to share the '{upgradeId}' upgrade (added by another mod)",
+                    new AcceptableValueRange<int>(0, 100)
+                )
+            );
+        }
+
+        // -------------------------------------------------------------------------
+        // Private helper
+        // -------------------------------------------------------------------------
+
+        private ConfigEntry<int> Bind(string key, string description, int defaultValue = 25)
+        {
+            return _config.Bind(
+                "Upgrades",
+                key,
+                defaultValue,
+                new ConfigDescription(description, new AcceptableValueRange<int>(0, 100))
+            );
         }
     }
 }
