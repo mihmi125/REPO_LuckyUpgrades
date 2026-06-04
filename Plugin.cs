@@ -57,6 +57,7 @@ public class Plugin : BaseUnityPlugin
         updateRunner.hideFlags = HideFlags.HideAndDontSave;
 
         Logger.LogInfo("Harmony patches applied!");
+        Logger.LogInfo("[LuckyUpgrades] AUTO-DETECTION enabled: Unknown upgrades will be auto-shared at DefaultModdedUpgradeChance rate");
     }
 
     // =========================================================================
@@ -287,9 +288,9 @@ public class Plugin : BaseUnityPlugin
     // =========================================================================
     // Harmony patch — single patch on ItemUpgrade.PlayUpgrade()
     //
+    // ENHANCED: Now auto-detects unknown upgrade components and shares them!
     // WHY: PunManager.Upgrade* only runs on the host. ItemUpgrade.PlayUpgrade()
     // fires on EVERY client when an upgrade is used, so we intercept here instead.
-    // We map the component type on the GameObject to our internal upgrade key.
     // =========================================================================
 
     [HarmonyPatch(typeof(ItemUpgrade), "PlayUpgrade")]
@@ -307,7 +308,19 @@ public class Plugin : BaseUnityPlugin
             string upgradeType = GetUpgradeType(__instance);
             Logger.LogDebug($"[LuckyUpgrades] DEBUG PlayUpgrade fired: type='{upgradeType}' mySteamID='{mySteamID}'");
 
-            if (string.IsNullOrEmpty(upgradeType)) return;
+            if (string.IsNullOrEmpty(upgradeType)) 
+            {
+                // AUTO-DETECTION: Try to find ANY ItemUpgrade component (including modded ones)
+                upgradeType = DetectUnknownUpgrade(__instance);
+                if (!string.IsNullOrEmpty(upgradeType))
+                {
+                    Logger.LogInfo($"[LuckyUpgrades] 🔍 AUTO-DETECTED unknown upgrade type: '{upgradeType}'");
+                }
+                else
+                {
+                    return;
+                }
+            }
 
             // Get the SteamID of the player who used this item
             string sourceSteamID = GetSteamIDFromItem(__instance);
@@ -357,6 +370,39 @@ public class Plugin : BaseUnityPlugin
     }
 
     /// <summary>
+    /// AUTO-DETECTION: Find unknown ItemUpgrade components that don't match built-in types
+    /// Uses the component's type name as the upgrade identifier
+    /// </summary>
+    private static string DetectUnknownUpgrade(ItemUpgrade item)
+    {
+        var go = item.gameObject;
+        var components = go.GetComponents<ItemUpgrade>();
+        
+        foreach (var component in components)
+        {
+            var componentType = component.GetType();
+            string typeName = componentType.Name;
+            
+            // Skip if it's the base ItemUpgrade class
+            if (typeName == "ItemUpgrade") continue;
+            
+            // Skip known types
+            if (typeName.StartsWith("ItemUpgradePlayer") || 
+                typeName.StartsWith("ItemUpgradeMap") || 
+                typeName.StartsWith("ItemUpgradeDeath"))
+            {
+                continue;
+            }
+            
+            // Found a modded upgrade!
+            Logger.LogInfo($"[LuckyUpgrades] 🔍 Found modded upgrade component: {typeName}");
+            return typeName;
+        }
+        
+        return null;
+    }
+
+    /// <summary>
     /// Applies one stack of the named upgrade to the given player via PunManager.
     /// </summary>
     private static void ApplyUpgradeByType(string upgradeType, string steamID)
@@ -376,6 +422,18 @@ public class Plugin : BaseUnityPlugin
             case "TumbleWings":    PunManager.instance.UpgradePlayerTumbleWings(steamID, 1);  break;
             case "CrouchRest":     PunManager.instance.UpgradePlayerCrouchRest(steamID, 1);   break;
             case "DeathHeadBattery": PunManager.instance.UpgradeDeathHeadBattery(steamID, 1); break;
+            default:
+                lock (ModdedUpgradeRegistryLock)
+                {
+                    if (_moddedUpgradeRegistry.TryGetValue(upgradeType, out var moddedEntry))
+                    {
+                        moddedEntry.apply(steamID, 1);
+                        return;
+                    }
+                }
+                // If not registered, use default chance via config
+                Logger.LogDebug($"[LuckyUpgrades] Sharing unregistered upgrade '{upgradeType}' using default config");
+                break;
         }
     }
 
