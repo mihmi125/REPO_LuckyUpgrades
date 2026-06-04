@@ -24,6 +24,11 @@ public class Plugin : BaseUnityPlugin
     private static readonly object _randomLock = new object();
     private static readonly System.Random _random = new System.Random();
 
+    // THREAD-SAFETY FIX: Add locks for shared data structures
+    private static readonly object _sharedUpgradesLock = new object();
+    private static readonly object _moddedUpgradeRegistryLock = new object();
+    private static readonly object _mySteamIDLock = new object();
+
     internal static string _mySteamID = null;
 
     // Tracks shared upgrades for reapplication on level transition
@@ -87,14 +92,17 @@ public class Plugin : BaseUnityPlugin
 
         shareChance = Math.Max(0, Math.Min(100, shareChance));
 
-        if (_moddedUpgradeRegistry.ContainsKey(upgradeId))
-            Logger?.LogWarning($"[LuckyUpgrades] Upgrade '{upgradeId}' already registered — overwriting.");
+        lock (_moddedUpgradeRegistryLock)
+        {
+            if (_moddedUpgradeRegistry.ContainsKey(upgradeId))
+                Logger?.LogWarning($"[LuckyUpgrades] Upgrade '{upgradeId}' already registered — overwriting.");
 
-        var configEntry = UpgradeConfiguration?.BindModdedUpgrade(upgradeId, shareChance);
-        int resolvedChance = configEntry?.Value ?? shareChance;
+            var configEntry = UpgradeConfiguration?.BindModdedUpgrade(upgradeId, shareChance);
+            int resolvedChance = configEntry?.Value ?? shareChance;
 
-        _moddedUpgradeRegistry[upgradeId] = (applyAction, resolvedChance);
-        Logger?.LogInfo($"[LuckyUpgrades] Registered modded upgrade: '{upgradeId}' ({resolvedChance}% share chance)");
+            _moddedUpgradeRegistry[upgradeId] = (applyAction, resolvedChance);
+            Logger?.LogInfo($"[LuckyUpgrades] Registered modded upgrade: '{upgradeId}' ({resolvedChance}% share chance)");
+        }
     }
 
     /// <summary>
@@ -105,10 +113,15 @@ public class Plugin : BaseUnityPlugin
     /// </summary>
     public static void TriggerModdedUpgradeShare(string upgradeId, string sourceSteamID, int amount = 1)
     {
-        if (!_moddedUpgradeRegistry.TryGetValue(upgradeId, out var entry))
+        (Action<string, int> apply, int chance) entry;
+        
+        lock (_moddedUpgradeRegistryLock)
         {
-            Logger?.LogWarning($"[LuckyUpgrades] TriggerModdedUpgradeShare: '{upgradeId}' is not registered. Call RegisterModdedUpgrade first.");
-            return;
+            if (!_moddedUpgradeRegistry.TryGetValue(upgradeId, out entry))
+            {
+                Logger?.LogWarning($"[LuckyUpgrades] TriggerModdedUpgradeShare: '{upgradeId}' is not registered. Call RegisterModdedUpgrade first.");
+                return;
+            }
         }
 
         ApplySharedUpgradeToSelf(upgradeId, sourceSteamID, amount,
@@ -127,29 +140,49 @@ public class Plugin : BaseUnityPlugin
 
     internal static string GetMySteamID()
     {
-        if (string.IsNullOrEmpty(_mySteamID))
+        lock (_mySteamIDLock)
         {
-            var localPlayer = SemiFunc.PlayerAvatarLocal();
-            if (localPlayer != null)
-                _mySteamID = SemiFunc.PlayerGetSteamID(localPlayer);
+            if (string.IsNullOrEmpty(_mySteamID))
+            {
+                var localPlayer = SemiFunc.PlayerAvatarLocal();
+                if (localPlayer != null)
+                {
+                    _mySteamID = SemiFunc.PlayerGetSteamID(localPlayer);
+                    if (!string.IsNullOrEmpty(_mySteamID))
+                        Logger?.LogInfo($"[LuckyUpgrades] Player SteamID cached: {_mySteamID}");
+                    else
+                        Logger?.LogWarning("[LuckyUpgrades] Failed to get player SteamID");
+                }
+                else
+                {
+                    Logger?.LogDebug("[LuckyUpgrades] Local player not found yet");
+                }
+            }
+            return _mySteamID;
         }
-        return _mySteamID;
     }
 
     internal static void ReapplySharedUpgrades()
     {
-        if (_sharedUpgrades.Count == 0) return;
+        Dictionary<string, int> upgradesToReapply;
+        
+        lock (_sharedUpgradesLock)
+        {
+            if (_sharedUpgrades.Count == 0) return;
+            // Create a snapshot to avoid concurrent modification
+            upgradesToReapply = new Dictionary<string, int>(_sharedUpgrades);
+        }
 
         string myID = GetMySteamID();
         if (string.IsNullOrEmpty(myID)) return;
 
-        Logger.LogInfo($"[LuckyUpgrades] Reapplying {_sharedUpgrades.Count} upgrade type(s)...");
+        Logger.LogInfo($"[LuckyUpgrades] Reapplying {upgradesToReapply.Count} upgrade type(s)...");
 
         try
         {
             Interlocked.Exchange(ref _isApplyingSharedUpgrade, 1);
 
-            foreach (var upgrade in _sharedUpgrades)
+            foreach (var upgrade in upgradesToReapply)
             {
                 string upgradeType = upgrade.Key;
                 int amount = upgrade.Value;
@@ -219,10 +252,13 @@ public class Plugin : BaseUnityPlugin
                 for (int i = 0; i < amount; i++) PunManager.instance.UpgradeDeathHeadBattery(myID, 1);
                 return true;
             default:
-                if (_moddedUpgradeRegistry.TryGetValue(upgradeType, out var moddedEntry))
+                lock (_moddedUpgradeRegistryLock)
                 {
-                    moddedEntry.apply(myID, amount);
-                    return true;
+                    if (_moddedUpgradeRegistry.TryGetValue(upgradeType, out var moddedEntry))
+                    {
+                        moddedEntry.apply(myID, amount);
+                        return true;
+                    }
                 }
                 return false;
         }
@@ -230,10 +266,13 @@ public class Plugin : BaseUnityPlugin
 
     private static void TrackSharedUpgrade(string upgradeType, int amount)
     {
-        if (!_sharedUpgrades.TryGetValue(upgradeType, out int current))
-            current = 0;
-        _sharedUpgrades[upgradeType] = current + amount;
-        Logger.LogInfo($"[LuckyUpgrades] Tracked: {upgradeType} (total: {_sharedUpgrades[upgradeType]})");
+        lock (_sharedUpgradesLock)
+        {
+            if (!_sharedUpgrades.TryGetValue(upgradeType, out int current))
+                current = 0;
+            _sharedUpgrades[upgradeType] = current + amount;
+            Logger.LogInfo($"[LuckyUpgrades] Tracked: {upgradeType} (total: {_sharedUpgrades[upgradeType]})");
+        }
     }
 
     // =========================================================================
@@ -481,17 +520,23 @@ public class UpgradeReapplyRunner : MonoBehaviour
 
             if (SESSION_END_LEVELS.Contains(currentLevel))
             {
-                Plugin._sharedUpgrades.Clear();
+                lock (Plugin._sharedUpgradesLock)
+                {
+                    Plugin._sharedUpgrades.Clear();
+                }
                 Plugin._mySteamID = null;
                 Plugin.Logger.LogInfo("[LuckyUpgrades] Session ended. All tracked data cleared.");
                 return;
             }
 
-            if (Plugin._sharedUpgrades.Count > 0)
+            lock (Plugin._sharedUpgradesLock)
             {
-                _pendingReapply = true;
-                _reapplyDelay = REAPPLY_DELAY_SECONDS;
-                Plugin.Logger.LogInfo($"[LuckyUpgrades] Scheduled reapply in {REAPPLY_DELAY_SECONDS}s...");
+                if (Plugin._sharedUpgrades.Count > 0)
+                {
+                    _pendingReapply = true;
+                    _reapplyDelay = REAPPLY_DELAY_SECONDS;
+                    Plugin.Logger.LogInfo($"[LuckyUpgrades] Scheduled reapply in {REAPPLY_DELAY_SECONDS}s...");
+                }
             }
         }
 
@@ -502,10 +547,16 @@ public class UpgradeReapplyRunner : MonoBehaviour
             {
                 _pendingReapply = false;
 
-                if (PhotonNetwork.IsMasterClient && Plugin._sharedUpgrades.Count == 0)
+                if (PhotonNetwork.IsMasterClient)
                 {
-                    Plugin.Logger.LogInfo("[LuckyUpgrades] Host with no received upgrades — skipping reapply.");
-                    return;
+                    lock (Plugin._sharedUpgradesLock)
+                    {
+                        if (Plugin._sharedUpgrades.Count == 0)
+                        {
+                            Plugin.Logger.LogInfo("[LuckyUpgrades] Host with no received upgrades — skipping reapply.");
+                            return;
+                        }
+                    }
                 }
 
                 var localPlayer = SemiFunc.PlayerAvatarLocal();
