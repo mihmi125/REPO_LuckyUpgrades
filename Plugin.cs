@@ -24,10 +24,10 @@ public class Plugin : BaseUnityPlugin
     private static readonly object _randomLock = new object();
     private static readonly System.Random _random = new System.Random();
 
-    // THREAD-SAFETY FIX: Add locks for shared data structures
-    private static readonly object _sharedUpgradesLock = new object();
-    private static readonly object _moddedUpgradeRegistryLock = new object();
-    private static readonly object _mySteamIDLock = new object();
+    // THREAD-SAFETY FIX: Make locks INTERNAL so UpgradeReapplyRunner can access them
+    internal static readonly object SharedUpgradesLock = new object();
+    internal static readonly object ModdedUpgradeRegistryLock = new object();
+    internal static readonly object MySteamIDLock = new object();
 
     internal static string _mySteamID = null;
 
@@ -92,7 +92,7 @@ public class Plugin : BaseUnityPlugin
 
         shareChance = Math.Max(0, Math.Min(100, shareChance));
 
-        lock (_moddedUpgradeRegistryLock)
+        lock (ModdedUpgradeRegistryLock)
         {
             if (_moddedUpgradeRegistry.ContainsKey(upgradeId))
                 Logger?.LogWarning($"[LuckyUpgrades] Upgrade '{upgradeId}' already registered — overwriting.");
@@ -115,7 +115,7 @@ public class Plugin : BaseUnityPlugin
     {
         (Action<string, int> apply, int chance) entry;
         
-        lock (_moddedUpgradeRegistryLock)
+        lock (ModdedUpgradeRegistryLock)
         {
             if (!_moddedUpgradeRegistry.TryGetValue(upgradeId, out entry))
             {
@@ -149,7 +149,7 @@ public class Plugin : BaseUnityPlugin
 
     internal static string GetMySteamID()
     {
-        lock (_mySteamIDLock)
+        lock (MySteamIDLock)
         {
             if (string.IsNullOrEmpty(_mySteamID))
             {
@@ -175,7 +175,7 @@ public class Plugin : BaseUnityPlugin
     {
         Dictionary<string, int> upgradesToReapply;
         
-        lock (_sharedUpgradesLock)
+        lock (SharedUpgradesLock)
         {
             if (_sharedUpgrades.Count == 0) return;
             // Create a snapshot to avoid concurrent modification
@@ -261,7 +261,7 @@ public class Plugin : BaseUnityPlugin
                 for (int i = 0; i < amount; i++) PunManager.instance.UpgradeDeathHeadBattery(myID, 1);
                 return true;
             default:
-                lock (_moddedUpgradeRegistryLock)
+                lock (ModdedUpgradeRegistryLock)
                 {
                     if (_moddedUpgradeRegistry.TryGetValue(upgradeType, out var moddedEntry))
                     {
@@ -275,7 +275,7 @@ public class Plugin : BaseUnityPlugin
 
     private static void TrackSharedUpgrade(string upgradeType, int amount)
     {
-        lock (_sharedUpgradesLock)
+        lock (SharedUpgradesLock)
         {
             if (!_sharedUpgrades.TryGetValue(upgradeType, out int current))
                 current = 0;
@@ -529,7 +529,7 @@ public class UpgradeReapplyRunner : MonoBehaviour
 
             if (SESSION_END_LEVELS.Contains(currentLevel))
             {
-                lock (Plugin._sharedUpgradesLock)
+                lock (Plugin.SharedUpgradesLock)
                 {
                     Plugin._sharedUpgrades.Clear();
                 }
@@ -538,7 +538,7 @@ public class UpgradeReapplyRunner : MonoBehaviour
                 return;
             }
 
-            lock (Plugin._sharedUpgradesLock)
+            lock (Plugin.SharedUpgradesLock)
             {
                 if (Plugin._sharedUpgrades.Count > 0)
                 {
@@ -558,7 +558,7 @@ public class UpgradeReapplyRunner : MonoBehaviour
 
                 if (PhotonNetwork.IsMasterClient)
                 {
-                    lock (Plugin._sharedUpgradesLock)
+                    lock (Plugin.SharedUpgradesLock)
                     {
                         if (Plugin._sharedUpgrades.Count == 0)
                         {
