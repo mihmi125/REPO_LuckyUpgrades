@@ -335,11 +335,16 @@ public class Plugin : BaseUnityPlugin
 
     /// <summary>
     /// Maps the concrete component type on the GameObject to our internal upgrade key string.
+    /// For vanilla upgrades, checks known ItemUpgrade* component types.
+    /// For REPOLib-based modded upgrades (NikkisUpgrades, GoopUpgrades, MoreUpgrades, etc.),
+    /// reflects on the PlayerUpgrade component to extract the upgrade ID and auto-registers it.
     /// Returns null if the type is not a recognised player upgrade.
     /// </summary>
     private static string GetUpgradeType(ItemUpgrade item)
     {
         var go = item.gameObject;
+
+        // --- Vanilla upgrades ---
         if      (go.GetComponent<ItemUpgradePlayerHealth>()      != null) return "Health";
         else if (go.GetComponent<ItemUpgradePlayerEnergy>()      != null) return "Energy";
         else if (go.GetComponent<ItemUpgradePlayerExtraJump>()   != null) return "ExtraJump";
@@ -353,11 +358,227 @@ public class Plugin : BaseUnityPlugin
         else if (go.GetComponent<ItemUpgradePlayerCrouchRest>()  != null) return "CrouchRest";
         else if (go.GetComponent<ItemUpgradeDeathHeadBattery>()  != null) return "DeathHeadBattery";
         else if (go.GetComponent<ItemUpgradeMapPlayerCount>()    != null) return "MapPlayerCount";
+
+        // --- REPOLib PlayerUpgrade (NikkisUpgrades, GoopUpgrades, MoreUpgrades, etc.) ---
+        // REPOLib registers upgrades as components whose type name contains "ItemUpgrade"
+        // and holds a reference to a PlayerUpgrade scriptable object with an upgradeName / id field.
+        string repolibId = TryGetREPOLibUpgradeId(go);
+        if (repolibId != null)
+        {
+            // Auto-register if not yet known so reapply and chance config work too
+            lock (ModdedUpgradeRegistryLock)
+            {
+                if (!_moddedUpgradeRegistry.ContainsKey(repolibId))
+                {
+                    var configEntry = UpgradeConfiguration?.BindModdedUpgrade(repolibId, 25);
+                    int resolvedChance = configEntry?.Value ?? 25;
+
+                    // Capture id for the closure
+                    string capturedId = repolibId;
+                    _moddedUpgradeRegistry[capturedId] = (
+                        (steamID, amount) => ApplyREPOLibUpgrade(capturedId, steamID, amount),
+                        resolvedChance
+                    );
+                    Logger?.LogInfo($"[LuckyUpgrades] Auto-registered REPOLib upgrade: '{capturedId}' ({resolvedChance}% share chance)");
+                }
+            }
+            return repolibId;
+        }
+
         return null;
     }
 
     /// <summary>
-    /// Applies one stack of the named upgrade to the given player via PunManager.
+    /// Attempts to extract the upgrade identifier from a REPOLib PlayerUpgrade component
+    /// sitting on the same GameObject as the ItemUpgrade.
+    ///
+    /// REPOLib (Zehs/CritHaxXoG) exposes upgrades via a MonoBehaviour that holds a
+    /// PlayerUpgrade (ScriptableObject). The SO has an "upgradeName" or "itemName" string
+    /// field we can read via reflection. We fall back to the component's type name if those
+    /// fields don't exist so future REPOLib versions are still covered.
+    /// </summary>
+    private static string TryGetREPOLibUpgradeId(GameObject go)
+    {
+        try
+        {
+            var components = go.GetComponents<MonoBehaviour>();
+            foreach (var comp in components)
+            {
+                if (comp == null) continue;
+                var compType = comp.GetType();
+
+                // REPOLib upgrade MonoBehaviours typically have "ItemUpgrade" in their type name
+                // but are NOT one of the vanilla types we already handled above.
+                // They also commonly expose a "playerUpgrade" or "upgrade" field of a REPOLib type.
+                var fields = compType.GetFields(
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Instance);
+
+                foreach (var field in fields)
+                {
+                    // Look for a field whose type name contains "PlayerUpgrade" (the REPOLib SO)
+                    if (!field.FieldType.Name.Contains("PlayerUpgrade")) continue;
+
+                    var upgradeObj = field.GetValue(comp);
+                    if (upgradeObj == null) continue;
+
+                    // Try to read a string identifier from the SO
+                    string id = ReadStringField(upgradeObj, "upgradeName")
+                             ?? ReadStringField(upgradeObj, "itemName")
+                             ?? ReadStringField(upgradeObj, "name")
+                             ?? ReadStringField(upgradeObj, "id");
+
+                    if (!string.IsNullOrEmpty(id))
+                    {
+                        // Prefix so it never collides with vanilla keys
+                        return "REPOLib_" + id;
+                    }
+
+                    // Fallback: use the SO's Unity object name
+                    if (upgradeObj is UnityEngine.Object uObj && !string.IsNullOrEmpty(uObj.name))
+                        return "REPOLib_" + uObj.name;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning($"[LuckyUpgrades] TryGetREPOLibUpgradeId failed: {ex.Message}");
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Reads a named string field or property from an arbitrary object via reflection.
+    /// Returns null if the field/property doesn't exist or is empty.
+    /// </summary>
+    private static string ReadStringField(object obj, string memberName)
+    {
+        try
+        {
+            var type = obj.GetType();
+
+            // Try field first
+            var field = type.GetField(memberName,
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance);
+            if (field != null && field.FieldType == typeof(string))
+            {
+                var val = field.GetValue(obj) as string;
+                if (!string.IsNullOrEmpty(val)) return val;
+            }
+
+            // Try property
+            var prop = type.GetProperty(memberName,
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance);
+            if (prop != null && prop.PropertyType == typeof(string))
+            {
+                var val = prop.GetValue(obj) as string;
+                if (!string.IsNullOrEmpty(val)) return val;
+            }
+        }
+        catch { /* ignore reflection errors */ }
+        return null;
+    }
+
+    /// <summary>
+    /// Applies a REPOLib-registered upgrade to a player by calling the registered action.
+    /// Called both from the auto-registered action closure AND from ReapplySingleUpgrade.
+    /// </summary>
+    private static void ApplyREPOLibUpgrade(string upgradeId, string steamID, int amount)
+    {
+        // The registered action in _moddedUpgradeRegistry already knows how to apply.
+        // This method is the action body itself — nothing extra to do here.
+        // (If a mod called RegisterModdedUpgrade manually, that action takes precedence.)
+        Logger?.LogInfo($"[LuckyUpgrades] ApplyREPOLibUpgrade: '{upgradeId}' → {steamID} +{amount}");
+
+        // For auto-registered REPOLib upgrades we don't have a direct PunManager call.
+        // We rely on REPOLib's own upgrade-application path via the PlayerUpgrade SO.
+        // The correct approach is to find the PlayerUpgrade SO and call its Upgrade() method.
+        TryApplyREPOLibUpgradeViaSO(upgradeId, steamID, amount);
+    }
+
+    /// <summary>
+    /// Finds the REPOLib PlayerUpgrade ScriptableObject by its name and calls its upgrade method.
+    /// REPOLib's Upgrades module keeps a registry; we search loaded SOs as a fallback.
+    /// </summary>
+    private static void TryApplyREPOLibUpgradeViaSO(string upgradeId, string steamID, int amount)
+    {
+        try
+        {
+            // Strip our prefix to get the original SO name
+            string soName = upgradeId.StartsWith("REPOLib_") ? upgradeId.Substring(8) : upgradeId;
+
+            // REPOLib registers upgrades in REPOLib.Modules.Upgrades. Try to invoke via reflection.
+            var repolibUpgradesType = System.Type.GetType("REPOLib.Modules.Upgrades, REPOLib");
+            if (repolibUpgradesType != null)
+            {
+                // Try GetPlayerUpgrade(string name) → PlayerUpgrade
+                var getMethod = repolibUpgradesType.GetMethod("GetPlayerUpgrade",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static,
+                    null, new[] { typeof(string) }, null);
+
+                if (getMethod != null)
+                {
+                    var playerUpgrade = getMethod.Invoke(null, new object[] { soName });
+                    if (playerUpgrade != null)
+                    {
+                        // PlayerUpgrade.Upgrade(string steamID, int amount) or similar
+                        var upgradeMethod = playerUpgrade.GetType().GetMethod("Upgrade",
+                            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                        if (upgradeMethod == null)
+                            upgradeMethod = playerUpgrade.GetType().GetMethod("ApplyUpgrade",
+                                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+
+                        if (upgradeMethod != null)
+                        {
+                            var upgradeParams = upgradeMethod.GetParameters();
+                            if (upgradeParams.Length == 2)
+                                upgradeMethod.Invoke(playerUpgrade, new object[] { steamID, amount });
+                            else if (upgradeParams.Length == 1)
+                                upgradeMethod.Invoke(playerUpgrade, new object[] { steamID });
+                            Logger?.LogInfo($"[LuckyUpgrades] REPOLib upgrade applied via SO: '{soName}' → {steamID}");
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Fallback: search all loaded PlayerUpgrade SOs in memory
+            var allUpgrades = Resources.FindObjectsOfTypeAll<ScriptableObject>();
+            foreach (var so in allUpgrades)
+            {
+                if (so == null) continue;
+                if (so.name != soName && !so.GetType().Name.Contains("PlayerUpgrade")) continue;
+
+                var upgradeMethod = so.GetType().GetMethod("Upgrade",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                if (upgradeMethod == null) continue;
+
+                var upgradeParams = upgradeMethod.GetParameters();
+                if (upgradeParams.Length == 2)
+                    upgradeMethod.Invoke(so, new object[] { steamID, amount });
+                else if (upgradeParams.Length == 1)
+                    upgradeMethod.Invoke(so, new object[] { steamID });
+                Logger?.LogInfo($"[LuckyUpgrades] REPOLib upgrade applied via Resources fallback: '{soName}' → {steamID}");
+                return;
+            }
+
+            Logger?.LogWarning($"[LuckyUpgrades] Could not apply REPOLib upgrade '{soName}' — no suitable method found. " +
+                               $"Call Plugin.RegisterModdedUpgrade(\"{upgradeId}\", ...) from your mod to provide an explicit apply action.");
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogError($"[LuckyUpgrades] TryApplyREPOLibUpgradeViaSO failed for '{upgradeId}': {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Applies one stack of the named upgrade to the given player via PunManager (vanilla)
+    /// or via the registered action for modded / REPOLib upgrades.
     /// </summary>
     private static void ApplyUpgradeByType(string upgradeType, string steamID)
     {
@@ -376,6 +597,16 @@ public class Plugin : BaseUnityPlugin
             case "TumbleWings":    PunManager.instance.UpgradePlayerTumbleWings(steamID, 1);  break;
             case "CrouchRest":     PunManager.instance.UpgradePlayerCrouchRest(steamID, 1);   break;
             case "DeathHeadBattery": PunManager.instance.UpgradeDeathHeadBattery(steamID, 1); break;
+            default:
+                // Modded / REPOLib upgrade — use the registered action
+                lock (ModdedUpgradeRegistryLock)
+                {
+                    if (_moddedUpgradeRegistry.TryGetValue(upgradeType, out var moddedEntry))
+                        moddedEntry.apply(steamID, 1);
+                    else
+                        Logger?.LogWarning($"[LuckyUpgrades] ApplyUpgradeByType: no action registered for '{upgradeType}'");
+                }
+                break;
         }
     }
 
