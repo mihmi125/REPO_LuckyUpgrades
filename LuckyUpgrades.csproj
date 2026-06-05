@@ -2,11 +2,12 @@
 
   <PropertyGroup>
     <TargetFramework>netstandard2.1</TargetFramework>
-    <AssemblyName>LuckyUpgrades</AssemblyName>
+    <AssemblyName>LuckyUpgradesFork</AssemblyName>
     <RootNamespace>LuckyUpgrades</RootNamespace>
-    <Version>1.1.6</Version>
-    <Authors>REPOShareMod</Authors>
-    <Description>R.E.P.O 업그레이드 확률 공유 모드 - 스탯 아이템 획득 시 설정된 확률에 따라 다른 플레이어에게도 적용</Description>
+    <PluginGuid>com.YourUsername.LuckyUpgradesFork</PluginGuid>
+    <Version>1.0.0</Version>
+    <Authors>mihmi125</Authors>
+    <Description>Fork of R.E.P.O LuckyUpgrades</Description>
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RestoreAdditionalProjectSources>

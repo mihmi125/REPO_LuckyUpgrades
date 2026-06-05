@@ -1,8 +1,8 @@
 {
-  "name": "LuckyUpgrades",
-  "version_number": "1.1.6",
-  "website_url": "https://github.com/ataraxia7899/REPO_LuckyUpgrades",
-  "description": "Probability-based upgrade sharing mod for R.E.P.O. All players must install for sharing to work.",
+  "name": "LuckyUpgradesFork",
+  "version_number": "1.0.0",
+  "website_url": "https://github.com/mihmi125/REPO_LuckyUpgrades",
+  "description": "Fork of LuckyUpgrades that adds support for custom upgrade types.",
   "dependencies": [
     "BepInEx-BepInExPack-5.4.2100"
   ]

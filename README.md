@@ -3,14 +3,16 @@
 ### 🌐 README Language : [English](README.md) | [한국어](README.ko.md)
 <br>
 
-# LuckyUpgrades
+# LuckyUpgrades Fork
+
+> **Note:** This is a modified fork of the original LuckyUpgrades by ataraxia7899. It adds full support for custom/modded upgrades alongside the base game upgrades.
 
 [![Language](https://img.shields.io/badge/Language-C%23-239120?logo=c-sharp&logoColor=white)](https://learn.microsoft.com/dotnet/csharp/)
-[![Thunderstore Profile](https://img.shields.io/badge/THUNDERSTORE-PROFILE-blue?logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/ataraxia7899/)
-[![Thunderstore Version](https://img.shields.io/thunderstore/v/ataraxia7899/LuckyUpgrades?label=THUNDERSTORE&color=00AFEC&logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/ataraxia7899/LuckyUpgrades/)
-[![Thunderstore Downloads](https://img.shields.io/thunderstore/dt/ataraxia7899/LuckyUpgrades?label=DOWNLOADS&color=00FF00&logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/ataraxia7899/LuckyUpgrades/)
+[![Thunderstore Profile](https://img.shields.io/badge/THUNDERSTORE-PROFILE-blue?logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/YourUsername/)
+[![Thunderstore Version](https://img.shields.io/thunderstore/v/YourUsername/LuckyUpgradesFork?label=THUNDERSTORE&color=00AFEC&logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/YourUsername/LuckyUpgradesFork/)
+[![Thunderstore Downloads](https://img.shields.io/thunderstore/dt/YourUsername/LuckyUpgradesFork?label=DOWNLOADS&color=00FF00&logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/YourUsername/LuckyUpgradesFork/)
 
-[**R.E.P.O Upgrade Sharing Mod (Thunderstore)**](https://thunderstore.io/c/repo/p/ataraxia7899/LuckyUpgrades/)
+[**R.E.P.O Upgrade Sharing Mod (Thunderstore)**](https://thunderstore.io/c/repo/p/YourUsername/LuckyUpgradesFork/)
 
 When a player picks up an upgrade item, there is a configurable chance that **ALL other players** will also receive the same upgrade.
 
@@ -46,9 +48,10 @@ When a player picks up an upgrade item, there is a configurable chance that **AL
 
 ### ✨ Features
 
-* 🎲 **Probability-based sharing**: Configurable share chance for each upgrade type
-* ⚙️ **Per-upgrade settings**: Set different chances for each upgrade
-* 🔧 **13 Upgrades supported**: All player upgrades are supported
+* 🧩 **Modded Upgrade Support (NEW)**: Fully supports upgrades added by other mods!
+* 🎲 **Probability-based sharing**: Configurable share chance for each upgrade type.
+* ⚙️ **Per-upgrade settings**: Set different chances for each upgrade.
+* 🔧 **Base Upgrades supported**: All 13 original player upgrades are supported.
 
 ---
 
@@ -56,6 +59,7 @@ When a player picks up an upgrade item, there is a configurable chance that **AL
 
 | Upgrade | Config Name | Default |
 | :--- | :--- | :--- |
+| **Any Modded Upgrade** | *(Dynamically Supported)* | 25% |
 | Health | `ChanceToActivatePlayerHealth` | 25% |
 | Energy (Stamina) | `ChanceToActivatePlayerEnergy` | 25% |
 | Sprint Speed | `ChanceToActivatePlayerSprintSpeed` | 25% |
@@ -76,33 +80,14 @@ When a player picks up an upgrade item, there is a configurable chance that **AL
 
 #### **Thunderstore Mod Manager (Recommended)**
 1.  Install Thunderstore Mod Manager
-2.  Search for **LuckyUpgrades** and install
+2.  Search for **LuckyUpgradesFork** and install
 3.  **Ensure all players in your lobby install the mod**
 
 #### **Manual Installation**
 1.  BepInEx must be installed
-2.  Copy `LuckyUpgrades.dll` to `BepInEx/plugins/` folder
+2.  Copy `LuckyUpgradesFork.dll` to `BepInEx/plugins/` folder
 3.  Launch the game
 4.  **Share the mod with all players in your lobby**
-
----
-
-### ⚙️ Configuration
-
-After launching the game, a config file will be created at:
-`BepInEx/config/LuckyUpgrades.cfg`
-
-```ini
-[Upgrades]
-
-## % Chance to share the Health upgrade (0-100)
-ChanceToActivatePlayerHealth = 25
-
-## % Chance to share the Energy upgrade (0-100)
-ChanceToActivatePlayerEnergy = 25
-
-## ... (all other upgrades with default 25%)
-```
 
 ---
 
@@ -110,11 +95,4 @@ ChanceToActivatePlayerEnergy = 25
 
 | Version | Changes |
 | :--- | :--- |
-| **1.1.6** | Session upgrade data now clears on return to Main Menu / Lobby. Added failure log for missed shared upgrades |
-| **1.1.5** | Fixed host upgrade duplication bug on level transition |
-| **1.1.4** | Added Quick Guide image to README |
-| **1.1.3** | Documentation update |
-| **1.1.2** | Fixed non-host player upgrade persistence on level transition |
-| **1.1.1** | Minor bug fixes |
-| **1.1.0** | Added upgrade reapplication system for level transitions |
-| **1.0.0** | Initial release with 13 upgrade sharing support |
+| **1.0.0** | Initial fork release. Added sharing support for custom/modded upgrades alongside all base game features from the original mod. |
