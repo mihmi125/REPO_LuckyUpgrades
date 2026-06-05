@@ -175,15 +175,21 @@ public class Plugin : BaseUnityPlugin
     /// </summary>
     public static void TriggerModdedUpgradeShare(string upgradeId, string sourceSteamID, int amount = 1)
     {
-        (Action<string, int> apply, Func<int> getChance) entry;
+        // Capture the delegates inside the lock so a concurrent RegisterModdedUpgrade()
+        // call cannot swap the entry out from under us between the TryGetValue and the
+        // actual invocation (TOCTOU race on the registry dictionary).
+        Action<string, int> applyDelegate;
+        int chance;
 
         lock (ModdedUpgradeRegistryLock)
         {
-            if (!_moddedUpgradeRegistry.TryGetValue(upgradeId, out entry))
+            if (!_moddedUpgradeRegistry.TryGetValue(upgradeId, out var entry))
             {
                 Logger?.LogError($"[LuckyUpgrades] ✗ TriggerModdedUpgradeShare: '{upgradeId}' NOT REGISTERED! Did you call RegisterModdedUpgrade()?");
                 return;
             }
+            applyDelegate = entry.apply;
+            chance        = entry.getChance();
         }
 
         Logger?.LogInfo($"[LuckyUpgrades] → TriggerModdedUpgradeShare called: '{upgradeId}' from {sourceSteamID}");
@@ -195,14 +201,14 @@ public class Plugin : BaseUnityPlugin
                 if (!string.IsNullOrEmpty(myID))
                 {
                     Logger?.LogInfo($"[LuckyUpgrades] → Applying modded upgrade '{upgradeId}' to player {myID} (+{amt})");
-                    entry.apply(myID, amt);
+                    applyDelegate(myID, amt);
                 }
                 else
                 {
                     Logger?.LogWarning($"[LuckyUpgrades] ✗ Cannot apply '{upgradeId}': SteamID is null/empty");
                 }
             },
-            chanceOverride: entry.getChance());
+            chanceOverride: chance);
     }
 
     // =========================================================================
@@ -240,8 +246,13 @@ public class Plugin : BaseUnityPlugin
         lock (SharedUpgradesLock)
         {
             if (_sharedUpgrades.Count == 0) return;
-            // Create a snapshot to avoid concurrent modification
+            // Snapshot and immediately clear so the counts start fresh from this level.
+            // Without clearing, each level transition would compound the totals:
+            // e.g. Investor tracked as 1 after level 1, re-applied as +1 on level 2,
+            // then if another Investor is shared it becomes tracked as 2, re-applied
+            // as +2 on level 3 (on top of the +1 already applied), and so on.
             upgradesToReapply = new Dictionary<string, int>(_sharedUpgrades);
+            _sharedUpgrades.Clear();
         }
 
         string myID = GetMySteamID();
@@ -361,7 +372,11 @@ public class Plugin : BaseUnityPlugin
     {
         try
         {
-            // Skip if we triggered this call ourselves
+            // Re-entrancy guard: skip if the upgrade we're about to fire was
+            // triggered by LuckyUpgrades itself (shared-upgrade apply or reapply).
+            // CompareExchange(ref x, 0, 0) is used as a thread-safe volatile read —
+            // it never writes because comparand == newValue, but it does emit the
+            // required memory barrier.  Equivalent to Volatile.Read(ref _isApplyingSharedUpgrade).
             if (Interlocked.CompareExchange(ref _isApplyingSharedUpgrade, 0, 0) == 1)
             {
                 return;
@@ -642,9 +657,11 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    // Cached reflection results for ApplyREPOLibUpgrade — resolved once, reused forever.
+    private static System.Type _repoLibUpgradesModuleType = null;
+    private static System.Reflection.MethodInfo _repoLibGetUpgradeMethod = null;
+
     // FIX: Use AddLevel(PlayerAvatar, int) as the primary apply method for REPOLib upgrades.
-    // The old code tried Upgrade(PlayerAvatar) which does not exist on REPOLib's PlayerUpgrade
-    // class — causing a silent no-op even when the share roll succeeded.
     private static void ApplyREPOLibUpgrade(string upgradeId, string steamID, int amount)
     {
         try
@@ -661,29 +678,38 @@ public class Plugin : BaseUnityPlugin
                 return;
             }
 
-            System.Type upgradesType = null;
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            // Resolve and cache on first call — previously did a full assembly scan on
+            // every single apply, causing hitches when reapplying multiple upgrades on load.
+            if (_repoLibUpgradesModuleType == null)
             {
-                try { upgradesType = asm.GetType("REPOLib.Modules.Upgrades"); }
-                catch { }
-                if (upgradesType != null) break;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try { _repoLibUpgradesModuleType = asm.GetType("REPOLib.Modules.Upgrades"); }
+                    catch { }
+                    if (_repoLibUpgradesModuleType != null) break;
+                }
             }
 
-            if (upgradesType == null)
+            if (_repoLibUpgradesModuleType == null)
             {
                 Logger.LogError("[LuckyUpgrades] Cannot find REPOLib.Modules.Upgrades");
                 return;
             }
 
-            var getUpgrade = upgradesType.GetMethod("GetUpgrade",
-                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static,
-                null, new[] { typeof(string) }, null);
+            if (_repoLibGetUpgradeMethod == null)
+            {
+                _repoLibGetUpgradeMethod = _repoLibUpgradesModuleType.GetMethod("GetUpgrade",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static,
+                    null, new[] { typeof(string) }, null);
+            }
 
-            if (getUpgrade == null)
+            if (_repoLibGetUpgradeMethod == null)
             {
                 Logger.LogError("[LuckyUpgrades] REPOLib.Modules.Upgrades.GetUpgrade(string) not found");
                 return;
             }
+
+            var getUpgrade = _repoLibGetUpgradeMethod;
 
             var playerUpgrade = getUpgrade.Invoke(null, new object[] { upgradeId });
             if (playerUpgrade == null)
@@ -742,30 +768,30 @@ public class Plugin : BaseUnityPlugin
     }
 
     /// <summary>
-    /// Applies one stack of the named upgrade to the given player via PunManager.
+    /// Applies the named upgrade to the given player via PunManager, respecting amount.
     /// </summary>
-    private static void ApplyUpgradeByType(string upgradeType, string steamID)
+    private static void ApplyUpgradeByType(string upgradeType, string steamID, int amount = 1)
     {
         switch (upgradeType)
         {
-            case "Health":         PunManager.instance.UpgradePlayerHealth(steamID, 1);       break;
-            case "Energy":         PunManager.instance.UpgradePlayerEnergy(steamID, 1);       break;
-            case "ExtraJump":      PunManager.instance.UpgradePlayerExtraJump(steamID, 1);    break;
-            case "GrabRange":      PunManager.instance.UpgradePlayerGrabRange(steamID, 1);    break;
-            case "GrabStrength":   PunManager.instance.UpgradePlayerGrabStrength(steamID, 1); break;
-            case "GrabThrow":      PunManager.instance.UpgradePlayerThrowStrength(steamID, 1);break;
-            case "SprintSpeed":    PunManager.instance.UpgradePlayerSprintSpeed(steamID, 1);  break;
-            case "TumbleLaunch":   PunManager.instance.UpgradePlayerTumbleLaunch(steamID, 1); break;
-            case "MapPlayerCount": PunManager.instance.UpgradeMapPlayerCount(steamID, 1);     break;
-            case "TumbleClimb":    PunManager.instance.UpgradePlayerTumbleClimb(steamID, 1);  break;
-            case "TumbleWings":    PunManager.instance.UpgradePlayerTumbleWings(steamID, 1);  break;
-            case "CrouchRest":     PunManager.instance.UpgradePlayerCrouchRest(steamID, 1);   break;
-            case "DeathHeadBattery": PunManager.instance.UpgradeDeathHeadBattery(steamID, 1); break;
+            case "Health":         for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerHealth(steamID, 1);       break;
+            case "Energy":         for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerEnergy(steamID, 1);       break;
+            case "ExtraJump":      for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerExtraJump(steamID, 1);    break;
+            case "GrabRange":      for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerGrabRange(steamID, 1);    break;
+            case "GrabStrength":   for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerGrabStrength(steamID, 1); break;
+            case "GrabThrow":      for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerThrowStrength(steamID, 1);break;
+            case "SprintSpeed":    for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerSprintSpeed(steamID, 1);  break;
+            case "TumbleLaunch":   for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerTumbleLaunch(steamID, 1); break;
+            case "MapPlayerCount": for (int i = 0; i < amount; i++) PunManager.instance.UpgradeMapPlayerCount(steamID, 1);     break;
+            case "TumbleClimb":    for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerTumbleClimb(steamID, 1);  break;
+            case "TumbleWings":    for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerTumbleWings(steamID, 1);  break;
+            case "CrouchRest":     for (int i = 0; i < amount; i++) PunManager.instance.UpgradePlayerCrouchRest(steamID, 1);   break;
+            case "DeathHeadBattery": for (int i = 0; i < amount; i++) PunManager.instance.UpgradeDeathHeadBattery(steamID, 1); break;
             default:
                 lock (ModdedUpgradeRegistryLock)
                 {
                     if (_moddedUpgradeRegistry.TryGetValue(upgradeType, out var entry))
-                        entry.apply(steamID, 1);
+                        entry.apply(steamID, amount);
                     else
                         Logger.LogWarning($"[LuckyUpgrades] ApplyUpgradeByType: no handler for '{upgradeType}'");
                 }
@@ -836,16 +862,22 @@ public class Plugin : BaseUnityPlugin
             // If chance is 100%, always apply without RNG
             if (shareChance >= 100)
             {
+                bool applied = false;
                 try
                 {
                     Interlocked.Exchange(ref _isApplyingSharedUpgrade, 1);
                     applyToSelf(amount);
-                    TrackSharedUpgrade(upgradeType, amount);
-                    Logger.LogInfo($"[LuckyUpgrades] Shared upgrade applied: {upgradeType} +{amount} (100% guaranteed) ✓");
+                    applied = true;
                 }
                 finally
                 {
                     Interlocked.Exchange(ref _isApplyingSharedUpgrade, 0);
+                }
+                // Only track after the guard is released and only if apply succeeded.
+                if (applied)
+                {
+                    TrackSharedUpgrade(upgradeType, amount);
+                    Logger.LogInfo($"[LuckyUpgrades] Shared upgrade applied: {upgradeType} +{amount} (100% guaranteed) ✓");
                 }
                 return;
             }
@@ -859,16 +891,22 @@ public class Plugin : BaseUnityPlugin
 
             if (roll < shareChance)
             {
+                bool applied = false;
                 try
                 {
                     Interlocked.Exchange(ref _isApplyingSharedUpgrade, 1);
                     applyToSelf(amount);
-                    TrackSharedUpgrade(upgradeType, amount);
-                    Logger.LogInfo($"[LuckyUpgrades] Shared upgrade applied: {upgradeType} +{amount} (rolled: {roll} | chance: {shareChance}%) ✓");
+                    applied = true;
                 }
                 finally
                 {
                     Interlocked.Exchange(ref _isApplyingSharedUpgrade, 0);
+                }
+                // Only track after the guard is released and only if apply succeeded.
+                if (applied)
+                {
+                    TrackSharedUpgrade(upgradeType, amount);
+                    Logger.LogInfo($"[LuckyUpgrades] Shared upgrade applied: {upgradeType} +{amount} (rolled: {roll} | chance: {shareChance}%) ✓");
                 }
             }
             else
@@ -890,11 +928,35 @@ public class Plugin : BaseUnityPlugin
 /// </summary>
 public class UpgradeReapplyRunner : MonoBehaviour
 {
-    private static readonly HashSet<string> SESSION_END_LEVELS = new HashSet<string>
+    // All level names that signal the end of an active run.
+    // State is cleared whenever ANY of these are entered so that _sharedUpgrades
+    // never leaks into a new lobby even if REPO renames a scene between patches.
+    // The additional "Lobby" / "Main" / "Menu" substrings are matched separately
+    // via IsSessionEndLevel() below so a simple rename can't slip through.
+    private static readonly HashSet<string> SESSION_END_LEVELS = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
         "Level - Main Menu",
-        "Level - Lobby Menu"
+        "Level - Lobby Menu",
+        "Level - MainMenu",      // alternate casing seen in some builds
+        "Level - LobbyMenu",
+        "Main Menu",
+        "Lobby",
+        "Lobby Menu",
     };
+
+    /// <summary>
+    /// Returns true if <paramref name="levelName"/> is a lobby / menu scene where
+    /// run state should be wiped.  Checks the explicit set first, then falls back
+    /// to a substring match so future renames don't silently break session cleanup.
+    /// </summary>
+    private static bool IsSessionEndLevel(string levelName)
+    {
+        if (SESSION_END_LEVELS.Contains(levelName)) return true;
+        // Substring guard: any scene whose name contains "menu" or "lobby"
+        // (case-insensitive) is treated as a non-run level.
+        return levelName.IndexOf("menu",  StringComparison.OrdinalIgnoreCase) >= 0
+            || levelName.IndexOf("lobby", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
 
     private string _lastLevelName = "";
     private float _reapplyDelay = 0f;
@@ -919,24 +981,40 @@ public class UpgradeReapplyRunner : MonoBehaviour
             Plugin.Logger.LogInfo($"[LuckyUpgrades] Level changed: {_lastLevelName} -> {currentLevel}");
             _lastLevelName = currentLevel;
 
-            if (SESSION_END_LEVELS.Contains(currentLevel))
+            if (IsSessionEndLevel(currentLevel))
             {
                 lock (Plugin.SharedUpgradesLock)
                 {
                     Plugin._sharedUpgrades.Clear();
                 }
-                Plugin._mySteamID = null;
+                // Reset under lock to prevent a data race with GetMySteamID(),
+                // which reads _mySteamID inside MySteamIDLock.
+                lock (Plugin.MySteamIDLock)
+                {
+                    Plugin._mySteamID = null;
+                }
                 Plugin.Logger.LogInfo("[LuckyUpgrades] Session ended. All tracked data cleared.");
                 return;
             }
 
+            // Evaluate the host guard at scheduling time, not after the delay.
+            // ReapplySharedUpgrades() clears _sharedUpgrades immediately on entry, so
+            // checking the count inside the delay callback would always see 0.
+            //
+            // The host (MasterClient) never needs a reapply: REPO persists upgrade levels
+            // natively for the host, so re-granting them would produce duplicates.
+            // Non-host clients lose their stat overrides on level load and DO need the reapply.
             lock (Plugin.SharedUpgradesLock)
             {
-                if (Plugin._sharedUpgrades.Count > 0)
+                if (!PhotonNetwork.IsMasterClient && Plugin._sharedUpgrades.Count > 0)
                 {
                     _pendingReapply = true;
                     _reapplyDelay = REAPPLY_DELAY_SECONDS;
                     Plugin.Logger.LogInfo($"[LuckyUpgrades] Scheduled reapply in {REAPPLY_DELAY_SECONDS}s...");
+                }
+                else if (PhotonNetwork.IsMasterClient && Plugin._sharedUpgrades.Count > 0)
+                {
+                    Plugin.Logger.LogInfo("[LuckyUpgrades] Host detected — skipping reapply (upgrades persist natively).");
                 }
             }
         }
@@ -946,26 +1024,24 @@ public class UpgradeReapplyRunner : MonoBehaviour
             _reapplyDelay -= Time.deltaTime;
             if (_reapplyDelay <= 0f)
             {
-                _pendingReapply = false;
-
-                if (PhotonNetwork.IsMasterClient)
+                // BUG FIX: don't clear _pendingReapply until we actually succeed.
+                // Previously a null player or missing SteamID caused a silent `return`
+                // after the flag was already cleared, dropping the reapply permanently.
+                var localPlayer = SemiFunc.PlayerAvatarLocal();
+                if (localPlayer == null)
                 {
-                    lock (Plugin.SharedUpgradesLock)
-                    {
-                        if (Plugin._sharedUpgrades.Count == 0)
-                        {
-                            Plugin.Logger.LogInfo("[LuckyUpgrades] Host with no received upgrades — skipping reapply.");
-                            return;
-                        }
-                    }
+                    _reapplyDelay = 0.5f; // player not spawned yet — retry shortly
+                    return;
                 }
 
-                var localPlayer = SemiFunc.PlayerAvatarLocal();
-                if (localPlayer == null) return;
-
                 string myID = Plugin.GetMySteamID();
-                if (string.IsNullOrEmpty(myID)) return;
+                if (string.IsNullOrEmpty(myID))
+                {
+                    _reapplyDelay = 0.5f; // SteamID not ready yet — retry shortly
+                    return;
+                }
 
+                _pendingReapply = false;
                 Plugin.ReapplySharedUpgrades();
             }
         }
