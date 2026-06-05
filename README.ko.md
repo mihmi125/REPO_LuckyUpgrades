@@ -3,14 +3,16 @@
 ### 🌐 README Language : [English](README.md) | [한국어](README.ko.md)
 <br>
 
-# LuckyUpgrades
+# LuckyUpgrades 포크
+
+> **참고:** 이 모드는 ataraxia7899님의 원본 LuckyUpgrades를 수정한 포크 버전입니다. 기본 게임 업그레이드와 함께 커스텀/모드 업그레이드에 대한 완벽한 지원을 추가했습니다.
 
 [![Language](https://img.shields.io/badge/Language-C%23-239120?logo=c-sharp&logoColor=white)](https://learn.microsoft.com/dotnet/csharp/)
-[![Thunderstore Profile](https://img.shields.io/badge/THUNDERSTORE-PROFILE-blue?logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/ataraxia7899/)
-[![Thunderstore Version](https://img.shields.io/thunderstore/v/ataraxia7899/LuckyUpgrades?label=THUNDERSTORE&color=00AFEC&logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/ataraxia7899/LuckyUpgrades/)
-[![Thunderstore Downloads](https://img.shields.io/thunderstore/dt/ataraxia7899/LuckyUpgrades?label=DOWNLOADS&color=00FF00&logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/ataraxia7899/LuckyUpgrades/)
+[![Thunderstore Profile](https://img.shields.io/badge/THUNDERSTORE-PROFILE-blue?logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/YourUsername/)
+[![Thunderstore Version](https://img.shields.io/thunderstore/v/YourUsername/LuckyUpgradesFork?label=THUNDERSTORE&color=00AFEC&logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/YourUsername/LuckyUpgradesFork/)
+[![Thunderstore Downloads](https://img.shields.io/thunderstore/dt/YourUsername/LuckyUpgradesFork?label=DOWNLOADS&color=00FF00&logo=thunderstore&logoColor=white)](https://thunderstore.io/c/repo/p/YourUsername/LuckyUpgradesFork/)
 
-[**R.E.P.O 업그레이드 공유 모드 (Thunderstore)**](https://thunderstore.io/c/repo/p/ataraxia7899/LuckyUpgrades/)
+[**R.E.P.O 업그레이드 공유 모드 (Thunderstore)**](https://thunderstore.io/c/repo/p/YourUsername/LuckyUpgradesFork/)
 
 플레이어가 업그레이드 아이템을 획득하면 설정된 확률에 따라 **다른 모든 플레이어**도 동일한 업그레이드를 받습니다.
 
@@ -46,9 +48,10 @@
 
 ### ✨ 주요 기능
 
+* 🧩 **모드 업그레이드 지원 (신규)**: 다른 모드에서 추가된 업그레이드도 완벽하게 지원합니다!
 * 🎲 **확률 기반 공유**: 각 업그레이드 유형별로 공유 확률 설정 가능
 * ⚙️ **개별 업그레이드 설정**: 업그레이드마다 다른 확률 지정 가능
-* 🔧 **13가지 업그레이드 지원**: 모든 플레이어 업그레이드 지원
+* 🔧 **기본 업그레이드 지원**: 기존 13가지 플레이어 업그레이드 모두 지원
 
 ---
 
@@ -56,6 +59,7 @@
 
 | 업그레이드 | 설정 이름 | 기본값 |
 | :--- | :--- | :--- |
+| **모든 커스텀/모드 업그레이드** | *(동적 지원)* | 25% |
 | 체력 | `ChanceToActivatePlayerHealth` | 25% |
 | 에너지 (스태미나) | `ChanceToActivatePlayerEnergy` | 25% |
 | 달리기 속도 | `ChanceToActivatePlayerSprintSpeed` | 25% |
@@ -76,33 +80,14 @@
 
 #### **Thunderstore 모드 매니저 (권장)**
 1.  Thunderstore Mod Manager 설치
-2.  **LuckyUpgrades** 검색 후 설치
+2.  **LuckyUpgradesFork** 검색 후 설치
 3.  **로비의 모든 플레이어가 모드를 설치해야 합니다**
 
 #### **수동 설치**
 1.  BepInEx가 설치되어 있어야 합니다
-2.  `LuckyUpgrades.dll`을 `BepInEx/plugins/` 폴더에 복사
+2.  `LuckyUpgradesFork.dll`을 `BepInEx/plugins/` 폴더에 복사
 3.  게임 실행
 4.  **로비의 모든 플레이어와 모드를 공유하세요**
-
----
-
-### ⚙️ 설정
-
-게임을 실행하면 다음 경로에 설정 파일이 생성됩니다:
-`BepInEx/config/LuckyUpgrades.cfg`
-
-```ini
-[Upgrades]
-
-## 체력 업그레이드 공유 확률 (0-100%)
-ChanceToActivatePlayerHealth = 25
-
-## 에너지 업그레이드 공유 확률 (0-100%)
-ChanceToActivatePlayerEnergy = 25
-
-## ... (모든 업그레이드 기본값 25%)
-```
 
 ---
 
@@ -110,11 +95,4 @@ ChanceToActivatePlayerEnergy = 25
 
 | 버전 | 변경 사항 |
 | :--- | :--- |
-| **1.1.6** | 메인메뉴/로비 복귀 시 세션 업그레이드 데이터 초기화. 확률 실패 시 로그 추가 |
-| **1.1.5** | 호스트의 레벨 전환 시 업그레이드 중복 적용 버그 수정 |
-| **1.1.4** | README에 빠른 가이드 이미지 추가 |
-| **1.1.3** | 문서 업데이트 |
-| **1.1.2** | 비호스트 플레이어의 레벨 전환 시 업그레이드 미유지 버그 수정 |
-| **1.1.1** | 사소한 버그 수정 |
-| **1.1.0** | 레벨 전환 시 업그레이드 재적용 시스템 추가 |
-| **1.0.0** | 13가지 업그레이드 공유 지원 초기 릴리스 |
+| **1.0.0** | 초기 포크 릴리스. 원본 모드의 모든 기본 게임 기능과 함께 커스텀/모드 업그레이드 공유 지원을 추가했습니다. |
