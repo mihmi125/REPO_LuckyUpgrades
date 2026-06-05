@@ -34,9 +34,11 @@ public class Plugin : BaseUnityPlugin
     // Tracks shared upgrades for reapplication on level transition
     internal static readonly Dictionary<string, int> _sharedUpgrades = new Dictionary<string, int>();
 
-    // Registry for modded upgrades registered by other mods
-    internal static readonly Dictionary<string, (Action<string, int> apply, int chance)> _moddedUpgradeRegistry
-        = new Dictionary<string, (Action<string, int>, int)>();
+    // Registry for modded upgrades registered by other mods.
+    // getChance is a live delegate so it always reads the current config value,
+    // never a stale snapshot baked in at registration time.
+    internal static readonly Dictionary<string, (Action<string, int> apply, Func<int> getChance)> _moddedUpgradeRegistry
+        = new Dictionary<string, (Action<string, int>, Func<int>)>();
 
     private Harmony _harmony;
 
@@ -49,12 +51,68 @@ public class Plugin : BaseUnityPlugin
         UpgradeConfiguration = new UpgradeConfig(Config);
 
         _harmony = new Harmony(MyPluginInfo.PLUGIN_GUID);
-        _harmony.PatchAll(typeof(Plugin));
+
+        // Discover and patch the upgrade-trigger method on ItemUpgrade by reflection.
+        // The method name has changed across game versions, so instead of hardcoding it
+        // we: (1) try known names, (2) fall back to scanning for a public void no-arg method
+        // that isn't inherited from MonoBehaviour/Component/Object/Behaviour.
+        var postfix = new HarmonyMethod(typeof(Plugin),
+            nameof(ItemUpgrade_PlayUpgrade_Postfix));
+        bool patched = false;
+
+        // Unity lifecycle / toggle methods that must never be patched.
+        var skipMethods = new HashSet<string>
+        {
+            "Start", "Awake", "Update", "FixedUpdate", "LateUpdate",
+            "OnEnable", "OnDisable", "OnDestroy", "Reset",
+            "ButtonToggle", "ButtonToggleLogic", "ButtonToggleRPC"
+        };
+
+        // 1. Try known names first (fastest path, no false positives).
+        //    "PlayerUpgrade" is the confirmed name in v0.4.4.3.
+        foreach (var methodName in new[] { "PlayerUpgrade", "PlayUpgrade", "Use", "Upgrade", "Activate", "OnUse", "UseUpgrade", "Apply" })
+        {
+            var target = AccessTools.DeclaredMethod(typeof(ItemUpgrade), methodName, new System.Type[0]);
+            if (target != null)
+            {
+                _harmony.Patch(target, postfix: postfix);
+                Logger.LogInfo($"[LuckyUpgrades] Patched ItemUpgrade.{methodName} ✓");
+                patched = true;
+                break;
+            }
+        }
+
+        // 2. Fallback: scan for a void no-arg method that isn't a Unity lifecycle or toggle method.
+        if (!patched)
+        {
+            foreach (var m in typeof(ItemUpgrade).GetMethods(
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.DeclaredOnly))
+            {
+                if (m.ReturnType == typeof(void) && m.GetParameters().Length == 0
+                    && !m.IsAbstract && !skipMethods.Contains(m.Name))
+                {
+                    _harmony.Patch(m, postfix: postfix);
+                    Logger.LogWarning($"[LuckyUpgrades] Fallback-patched ItemUpgrade.{m.Name} — verify this is the upgrade trigger!");
+                    patched = true;
+                    break;
+                }
+            }
+        }
+
+        if (!patched)
+            Logger.LogError("[LuckyUpgrades] Could not find any suitable method on ItemUpgrade to patch — sharing will not work! Check the method list above.");
 
         var updateRunner = new GameObject("LuckyUpgrades_UpdateRunner");
         updateRunner.AddComponent<UpgradeReapplyRunner>();
         UnityEngine.Object.DontDestroyOnLoad(updateRunner);
         updateRunner.hideFlags = HideFlags.HideAndDontSave;
+
+        // Eagerly bind config entries for every upgrade already registered in REPOLib
+        // so they appear in the .cfg file from the very first launch and survive restarts.
+        PreBindREPOLibUpgrades();
 
         Logger.LogInfo("Harmony patches applied!");
     }
@@ -98,10 +156,14 @@ public class Plugin : BaseUnityPlugin
                 Logger?.LogWarning($"[LuckyUpgrades] Upgrade '{upgradeId}' already registered — overwriting.");
 
             var configEntry = UpgradeConfiguration?.BindModdedUpgrade(upgradeId, shareChance);
-            int resolvedChance = configEntry?.Value ?? shareChance;
+            // Store a live delegate so every roll reads the current config value,
+            // not the value that happened to be set at registration time.
+            Func<int> getChance = configEntry != null
+                ? (Func<int>)(() => configEntry.Value)
+                : (Func<int>)(() => shareChance);
 
-            _moddedUpgradeRegistry[upgradeId] = (applyAction, resolvedChance);
-            Logger?.LogInfo($"[LuckyUpgrades] ✓ REGISTERED modded upgrade: '{upgradeId}' ({resolvedChance}% share chance)");
+            _moddedUpgradeRegistry[upgradeId] = (applyAction, getChance);
+            Logger?.LogInfo($"[LuckyUpgrades] ✓ REGISTERED modded upgrade: '{upgradeId}' ({getChance()}% share chance)");
         }
     }
 
@@ -113,8 +175,8 @@ public class Plugin : BaseUnityPlugin
     /// </summary>
     public static void TriggerModdedUpgradeShare(string upgradeId, string sourceSteamID, int amount = 1)
     {
-        (Action<string, int> apply, int chance) entry;
-        
+        (Action<string, int> apply, Func<int> getChance) entry;
+
         lock (ModdedUpgradeRegistryLock)
         {
             if (!_moddedUpgradeRegistry.TryGetValue(upgradeId, out entry))
@@ -125,7 +187,7 @@ public class Plugin : BaseUnityPlugin
         }
 
         Logger?.LogInfo($"[LuckyUpgrades] → TriggerModdedUpgradeShare called: '{upgradeId}' from {sourceSteamID}");
-        
+
         ApplySharedUpgradeToSelf(upgradeId, sourceSteamID, amount,
             applyToSelf: (amt) =>
             {
@@ -140,7 +202,7 @@ public class Plugin : BaseUnityPlugin
                     Logger?.LogWarning($"[LuckyUpgrades] ✗ Cannot apply '{upgradeId}': SteamID is null/empty");
                 }
             },
-            chanceOverride: entry.chance);
+            chanceOverride: entry.getChance());
     }
 
     // =========================================================================
@@ -174,7 +236,7 @@ public class Plugin : BaseUnityPlugin
     internal static void ReapplySharedUpgrades()
     {
         Dictionary<string, int> upgradesToReapply;
-        
+
         lock (SharedUpgradesLock)
         {
             if (_sharedUpgrades.Count == 0) return;
@@ -292,8 +354,9 @@ public class Plugin : BaseUnityPlugin
     // We map the component type on the GameObject to our internal upgrade key.
     // =========================================================================
 
-    [HarmonyPatch(typeof(ItemUpgrade), "PlayUpgrade")]
-    [HarmonyPostfix]
+    // NOTE: The method was renamed in a game update. We patch manually in Awake()
+    // to try "PlayUpgrade" first and fall back to "Use" so the patch never silently no-ops.
+    // This method is registered as the postfix target via _harmony.Patch() below.
     public static void ItemUpgrade_PlayUpgrade_Postfix(ItemUpgrade __instance)
     {
         try
@@ -301,50 +364,32 @@ public class Plugin : BaseUnityPlugin
             // Skip if we triggered this call ourselves
             if (Interlocked.CompareExchange(ref _isApplyingSharedUpgrade, 0, 0) == 1)
             {
-                Logger.LogInfo("[LuckyUpgrades] DIAG: skipped (re-entrancy guard)");
                 return;
             }
 
             string mySteamID = GetMySteamID();
-            Logger.LogInfo($"[LuckyUpgrades] DIAG: PlayUpgrade fired on GO='{__instance.gameObject.name}' mySteamID='{mySteamID}'");
-
-            // Log every component on the GameObject so we can see what's there
-            var allComps = __instance.gameObject.GetComponents<UnityEngine.Component>();
-            foreach (var c in allComps)
-                Logger.LogInfo($"[LuckyUpgrades] DIAG:   component: {c?.GetType()?.FullName ?? "null"}");
 
             // Identify upgrade type
             string upgradeType = GetUpgradeType(__instance);
-            Logger.LogInfo($"[LuckyUpgrades] DIAG: upgradeType='{upgradeType ?? "NULL"}'");
-
-            if (string.IsNullOrEmpty(upgradeType))
-            {
-                Logger.LogInfo("[LuckyUpgrades] DIAG: aborting — upgradeType is null/empty");
-                return;
-            }
+            if (string.IsNullOrEmpty(upgradeType)) return;
 
             // Get source SteamID
             string sourceSteamID = GetSteamIDFromItem(__instance);
-            Logger.LogInfo($"[LuckyUpgrades] DIAG: sourceSteamID='{sourceSteamID ?? "NULL"}'");
+            if (string.IsNullOrEmpty(sourceSteamID)) return;
+            if (string.IsNullOrEmpty(mySteamID)) return;
 
-            if (string.IsNullOrEmpty(sourceSteamID))
-            {
-                Logger.LogInfo("[LuckyUpgrades] DIAG: aborting — sourceSteamID is null/empty");
-                return;
-            }
-            if (string.IsNullOrEmpty(mySteamID))
-            {
-                Logger.LogInfo("[LuckyUpgrades] DIAG: aborting — mySteamID is null/empty");
-                return;
-            }
+            // Skip if this player picked up the upgrade themselves
+            if (mySteamID == sourceSteamID) return;
 
-            if (mySteamID == sourceSteamID)
+            // Look up the chance from the registry for REPOLib/modded upgrades
+            // so we use the current config value rather than falling through to
+            // GetShareChance which only knows about the 13 built-in upgrade keys.
+            int? chanceOverride = null;
+            lock (ModdedUpgradeRegistryLock)
             {
-                Logger.LogInfo("[LuckyUpgrades] DIAG: skipping — this is MY upgrade");
-                return;
+                if (_moddedUpgradeRegistry.TryGetValue(upgradeType, out var registryEntry))
+                    chanceOverride = registryEntry.getChance();
             }
-
-            Logger.LogInfo($"[LuckyUpgrades] DIAG: proceeding to share '{upgradeType}' from {sourceSteamID} → {mySteamID}");
 
             ApplySharedUpgradeToSelf(upgradeType, sourceSteamID, 1,
                 applyToSelf: (_) =>
@@ -352,7 +397,8 @@ public class Plugin : BaseUnityPlugin
                     string myID = GetMySteamID();
                     if (!string.IsNullOrEmpty(myID))
                         ApplyUpgradeByType(upgradeType, myID);
-                });
+                },
+                chanceOverride: chanceOverride);
         }
         catch (Exception ex)
         {
@@ -360,8 +406,11 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    // Cache for REPOLib type detection
-    private static bool _repoLibTypeSearched = false;
+    // Cache for REPOLib type detection.
+    // null  = not yet searched (or search should be retried)
+    // false = searched and not found
+    // true  = found (type is in _repoLibItemUpgradeType)
+    private static bool? _repoLibTypeSearched = null;
     private static System.Type _repoLibItemUpgradeType = null;
     private static System.Reflection.FieldInfo _repoLibUpgradeIdField = null;
 
@@ -394,10 +443,11 @@ public class Plugin : BaseUnityPlugin
     {
         try
         {
-            if (!_repoLibTypeSearched)
+            // Retry the type search if we haven't found it yet.
+            // REPOLib may load after LuckyUpgrades, so we keep trying until found.
+            if (_repoLibTypeSearched != true)
             {
-                _repoLibTypeSearched = true;
-                Logger.LogInfo("[LuckyUpgrades] DIAG: searching for REPOLibItemUpgrade type...");
+                _repoLibTypeSearched = false; // mark as "searched this attempt"
 
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
@@ -408,7 +458,6 @@ public class Plugin : BaseUnityPlugin
                             if (t.Name == "REPOLibItemUpgrade")
                             {
                                 _repoLibItemUpgradeType = t;
-                                Logger.LogInfo($"[LuckyUpgrades] DIAG: found REPOLibItemUpgrade in {asm.GetName().Name}: {t.FullName}");
                                 break;
                             }
                         }
@@ -417,28 +466,17 @@ public class Plugin : BaseUnityPlugin
                     if (_repoLibItemUpgradeType != null) break;
                 }
 
-                if (_repoLibItemUpgradeType == null)
+                if (_repoLibItemUpgradeType != null)
                 {
-                    Logger.LogInfo("[LuckyUpgrades] DIAG: REPOLibItemUpgrade type NOT found in any assembly");
-                }
-                else
-                {
-                    // Log all fields so we can see the right name
-                    Logger.LogInfo("[LuckyUpgrades] DIAG: REPOLibItemUpgrade fields:");
-                    foreach (var f in _repoLibItemUpgradeType.GetFields(
-                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
-                        Logger.LogInfo($"[LuckyUpgrades] DIAG:   field '{f.Name}' ({f.FieldType.Name})");
-                    foreach (var p in _repoLibItemUpgradeType.GetProperties(
-                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
-                        Logger.LogInfo($"[LuckyUpgrades] DIAG:   prop  '{p.Name}' ({p.PropertyType.Name})");
-
+                    Logger.LogInfo($"[LuckyUpgrades] Found REPOLibItemUpgrade — resolving upgradeId field...");
                     // Find the upgradeId field
                     _repoLibUpgradeIdField =
                         _repoLibItemUpgradeType.GetField("upgradeId",  System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance) ??
                         _repoLibItemUpgradeType.GetField("_upgradeId", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance) ??
                         _repoLibItemUpgradeType.GetField("UpgradeId",  System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
 
-                    Logger.LogInfo($"[LuckyUpgrades] DIAG: upgradeId field = {_repoLibUpgradeIdField?.Name ?? "NOT FOUND"}");
+                    // Type found — stop retrying on every call
+                    _repoLibTypeSearched = true;
                 }
             }
 
@@ -447,16 +485,13 @@ public class Plugin : BaseUnityPlugin
             var comp = go.GetComponent(_repoLibItemUpgradeType);
             if (comp == null) return null;
 
-            Logger.LogInfo($"[LuckyUpgrades] DIAG: found REPOLibItemUpgrade component on {go.name}");
-
             if (_repoLibUpgradeIdField == null)
             {
-                Logger.LogInfo("[LuckyUpgrades] DIAG: upgradeId field not resolved, cannot read id");
+                Logger.LogWarning("[LuckyUpgrades] upgradeId field not resolved on REPOLibItemUpgrade — cannot share this upgrade type.");
                 return null;
             }
 
             string upgradeId = _repoLibUpgradeIdField.GetValue(comp) as string;
-            Logger.LogInfo($"[LuckyUpgrades] DIAG: REPOLib upgradeId='{upgradeId ?? "NULL"}'");
 
             if (string.IsNullOrEmpty(upgradeId)) return null;
 
@@ -465,14 +500,20 @@ public class Plugin : BaseUnityPlugin
             {
                 if (!_moddedUpgradeRegistry.ContainsKey(upgradeId))
                 {
-                    var configEntry = UpgradeConfiguration?.BindModdedUpgrade(upgradeId, 25);
-                    int resolvedChance = configEntry?.Value ?? 25;
+                    // Use DefaultModdedUpgradeChance as the default so changing it in the
+                    // config actually affects auto-registered REPOLib upgrades.
+                    int defaultChance = UpgradeConfiguration?.DefaultModdedUpgradeChance.Value ?? 25;
+                    var configEntry = UpgradeConfiguration?.BindModdedUpgrade(upgradeId, defaultChance);
+                    // Live delegate — reads the config value on every roll, never stale
+                    Func<int> getChance = configEntry != null
+                        ? (Func<int>)(() => configEntry.Value)
+                        : (Func<int>)(() => UpgradeConfiguration?.DefaultModdedUpgradeChance.Value ?? 25);
                     string capturedId = upgradeId;
                     _moddedUpgradeRegistry[capturedId] = (
                         (steamID, amount) => ApplyREPOLibUpgrade(capturedId, steamID, amount),
-                        resolvedChance
+                        getChance
                     );
-                    Logger.LogInfo($"[LuckyUpgrades] Auto-registered REPOLib upgrade: '{capturedId}' ({resolvedChance}%)");
+                    Logger.LogInfo($"[LuckyUpgrades] Auto-registered REPOLib upgrade: '{capturedId}' ({getChance()}%)");
                 }
             }
             return upgradeId;
@@ -484,6 +525,126 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
+    /// <summary>
+    /// Scans REPOLib.Modules.Upgrades at startup and pre-binds a config entry for every
+    /// registered upgrade. This ensures entries appear in the .cfg immediately on first
+    /// launch and are correctly restored on subsequent launches.
+    /// </summary>
+    private static void PreBindREPOLibUpgrades()
+    {
+        // IMPORTANT: We must extract IDs using the _upgradeId FIELD on each PlayerUpgrade object,
+        // NOT the dictionary keys. TryGetREPOLibUpgradeId reads _upgradeId at runtime, so both
+        // code paths must use the same source to produce matching registry keys.
+        try
+        {
+            // Find REPOLib.Modules.Upgrades type
+            System.Type upgradesType = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try { upgradesType = asm.GetType("REPOLib.Modules.Upgrades"); }
+                catch { }
+                if (upgradesType != null) break;
+            }
+
+            if (upgradesType == null)
+            {
+                Logger.LogInfo("[LuckyUpgrades] REPOLib.Modules.Upgrades not found at startup — will bind on first encounter instead.");
+                return;
+            }
+
+            // Collect all PlayerUpgrade objects from REPOLib (via GetAll, GetUpgrades, or dict values)
+            var upgradeObjects = new List<object>();
+
+            foreach (var methodName in new[] { "GetAll", "GetUpgrades", "GetRegistered" })
+            {
+                var m = upgradesType.GetMethod(methodName,
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (m == null) continue;
+                var result = m.Invoke(null, null);
+                if (result is System.Collections.IEnumerable objEnum)
+                {
+                    foreach (var obj in objEnum)
+                        if (obj != null) upgradeObjects.Add(obj);
+                }
+                if (upgradeObjects.Count > 0) break;
+            }
+
+            // Fallback: dictionary values
+            if (upgradeObjects.Count == 0)
+            {
+                foreach (var field in upgradesType.GetFields(
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static))
+                {
+                    var val = field.GetValue(null);
+                    if (val is System.Collections.IDictionary dict)
+                    {
+                        foreach (var v in dict.Values)
+                            if (v != null) upgradeObjects.Add(v);
+                        if (upgradeObjects.Count > 0) break;
+                    }
+                }
+            }
+
+            if (upgradeObjects.Count == 0)
+            {
+                Logger.LogInfo("[LuckyUpgrades] Could not enumerate REPOLib upgrades at startup — will bind on first encounter.");
+                return;
+            }
+
+            // Extract ID using the same field that TryGetREPOLibUpgradeId uses at runtime:
+            // _upgradeId (private backing field) or UpgradeId (public property).
+            // This guarantees the registry key matches what the postfix produces.
+            int defaultChance = UpgradeConfiguration?.DefaultModdedUpgradeChance.Value ?? 25;
+            int count = 0;
+            foreach (var obj in upgradeObjects)
+            {
+                System.Type objType = obj.GetType();
+
+                var idField =
+                    objType.GetField("_upgradeId", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance) ??
+                    objType.GetField("upgradeId",  System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance) ??
+                    objType.GetField("UpgradeId",  System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+                var idProp =
+                    objType.GetProperty("UpgradeId", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance) ??
+                    objType.GetProperty("upgradeId", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+                // Field takes priority (matches TryGetREPOLibUpgradeId which reads _upgradeId field)
+                string id = (idField?.GetValue(obj) ?? idProp?.GetValue(obj)) as string;
+
+                Logger.LogInfo($"[LuckyUpgrades] Pre-bind: found REPOLib upgrade id='{id ?? "NULL"}'");
+                if (string.IsNullOrEmpty(id)) continue;
+
+                lock (ModdedUpgradeRegistryLock)
+                {
+                    if (!_moddedUpgradeRegistry.ContainsKey(id))
+                    {
+                        var configEntry = UpgradeConfiguration?.BindModdedUpgrade(id, defaultChance);
+                        // Live delegate — reads config on every roll, never a stale snapshot
+                        Func<int> getChance = configEntry != null
+                            ? (Func<int>)(() => configEntry.Value)
+                            : (Func<int>)(() => UpgradeConfiguration?.DefaultModdedUpgradeChance.Value ?? 25);
+                        string capturedId = id;
+                        _moddedUpgradeRegistry[capturedId] = (
+                            (steamID, amount) => ApplyREPOLibUpgrade(capturedId, steamID, amount),
+                            getChance
+                        );
+                        count++;
+                        Logger.LogInfo($"[LuckyUpgrades] Pre-bound '{capturedId}' ({getChance()}%) to config");
+                    }
+                }
+            }
+            Logger.LogInfo($"[LuckyUpgrades] Pre-bound {count} REPOLib upgrade(s) to config ✓");
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning($"[LuckyUpgrades] PreBindREPOLibUpgrades failed: {ex.Message}");
+        }
+    }
+
+    // FIX: Use AddLevel(PlayerAvatar, int) as the primary apply method for REPOLib upgrades.
+    // The old code tried Upgrade(PlayerAvatar) which does not exist on REPOLib's PlayerUpgrade
+    // class — causing a silent no-op even when the share roll succeeded.
     private static void ApplyREPOLibUpgrade(string upgradeId, string steamID, int amount)
     {
         try
@@ -531,23 +692,48 @@ public class Plugin : BaseUnityPlugin
                 return;
             }
 
-            var upgradeMethod = playerUpgrade.GetType().GetMethod("Upgrade",
+            // FIX: Try AddLevel(PlayerAvatar, int) first — this is the actual method on
+            // REPOLib's PlayerUpgrade class. Fall back to Upgrade(PlayerAvatar) for any
+            // future API changes, then AddLevel(PlayerAvatar) as a last resort.
+            var upgradeType = playerUpgrade.GetType();
+
+            var addLevelWithAmount = upgradeType.GetMethod("AddLevel",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance,
+                null, new[] { typeof(PlayerAvatar), typeof(int) }, null);
+
+            var upgradeMethod = upgradeType.GetMethod("Upgrade",
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance,
                 null, new[] { typeof(PlayerAvatar) }, null);
 
-            if (upgradeMethod == null)
+            var addLevelNoAmount = upgradeType.GetMethod("AddLevel",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance,
+                null, new[] { typeof(PlayerAvatar) }, null);
+
+            if (addLevelWithAmount != null)
             {
-                // Log all methods on PlayerUpgrade so we can find the right one
-                Logger.LogWarning($"[LuckyUpgrades] PlayerUpgrade.Upgrade(PlayerAvatar) not found, methods available:");
-                foreach (var m in playerUpgrade.GetType().GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
-                    Logger.LogWarning($"[LuckyUpgrades]   {m.Name}({string.Join(", ", System.Array.ConvertAll(m.GetParameters(), p => p.ParameterType.Name))})");
-                return;
+                // Most efficient: pass amount directly
+                addLevelWithAmount.Invoke(playerUpgrade, new object[] { target, amount });
+                Logger.LogInfo($"[LuckyUpgrades] Applied REPOLib upgrade '{upgradeId}' to {steamID} x{amount} via AddLevel(PlayerAvatar, int) ✓");
             }
-
-            for (int i = 0; i < amount; i++)
-                upgradeMethod.Invoke(playerUpgrade, new object[] { target });
-
-            Logger.LogInfo($"[LuckyUpgrades] Applied REPOLib upgrade '{upgradeId}' to {steamID} x{amount} ✓");
+            else if (upgradeMethod != null)
+            {
+                for (int i = 0; i < amount; i++)
+                    upgradeMethod.Invoke(playerUpgrade, new object[] { target });
+                Logger.LogInfo($"[LuckyUpgrades] Applied REPOLib upgrade '{upgradeId}' to {steamID} x{amount} via Upgrade(PlayerAvatar) ✓");
+            }
+            else if (addLevelNoAmount != null)
+            {
+                for (int i = 0; i < amount; i++)
+                    addLevelNoAmount.Invoke(playerUpgrade, new object[] { target });
+                Logger.LogInfo($"[LuckyUpgrades] Applied REPOLib upgrade '{upgradeId}' to {steamID} x{amount} via AddLevel(PlayerAvatar) ✓");
+            }
+            else
+            {
+                // Nothing worked — log all available methods so this is easy to diagnose next time
+                Logger.LogWarning($"[LuckyUpgrades] No applicable upgrade method found on PlayerUpgrade for '{upgradeId}'. Methods available:");
+                foreach (var m in upgradeType.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+                    Logger.LogWarning($"[LuckyUpgrades]   {m.Name}({string.Join(", ", System.Array.ConvertAll(m.GetParameters(), p => p.ParameterType.Name))})");
+            }
         }
         catch (Exception ex)
         {
@@ -629,7 +815,6 @@ public class Plugin : BaseUnityPlugin
 
     /// <summary>
     /// Rolls the share chance and applies the upgrade to the local player if successful.
-    /// FIXED: Now handles 100% probability and edge cases correctly.
     /// </summary>
     private static void ApplySharedUpgradeToSelf(
         string upgradeType,
@@ -642,7 +827,6 @@ public class Plugin : BaseUnityPlugin
         {
             int shareChance = chanceOverride ?? UpgradeConfiguration.GetShareChance(upgradeType);
 
-            // CRITICAL FIX: Handle 100% probability and edge cases properly
             if (shareChance <= 0)
             {
                 Logger.LogInfo($"[LuckyUpgrades] Shared upgrade skipped: {upgradeType} (0% chance) ✗");
