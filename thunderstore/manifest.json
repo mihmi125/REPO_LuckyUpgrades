@@ -1,6 +1,6 @@
 {
   "name": "LuckyUpgradesFork",
-  "version_number": "1.0.1",
+  "version_number": "1.1.0",
   "website_url": "https://github.com/mihmi125/REPO_LuckyUpgrades",
   "description": "Fork of LuckyUpgrades that adds support for custom upgrade types.",
   "dependencies": [

@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Threading;
 using BepInEx;
@@ -21,8 +22,31 @@ public class Plugin : BaseUnityPlugin
     // Thread-safe re-entrancy guard (0 = not applying, 1 = applying)
     private static int _isApplyingSharedUpgrade = 0;
 
+    // Additional per-type guard: prevents the rare duplicate where PunManager's
+    // network sync re-triggers ItemUpgrade.PlayerUpgrade for the same upgrade type
+    // on the same client within a single frame, before _isApplyingSharedUpgrade is set.
+    private static readonly HashSet<string> _inFlightUpgrades = new HashSet<string>();
+    private static readonly object _inFlightLock = new object();
+
     private static readonly object _randomLock = new object();
     private static readonly System.Random _random = new System.Random();
+
+    // ── QoL: per-instance cooldown ───────────────────────────────────────────
+    // Keyed by the GameObject's instance ID, NOT the upgrade type.
+    // This means two different Health upgrades picked up quickly always both roll —
+    // only the exact same item firing twice (physics jitter / double-trigger) is suppressed.
+    private static readonly Dictionary<int, float> _lastTriggerTime = new Dictionary<int, float>();
+    private static readonly object _cooldownLock = new object();
+
+    // ── QoL: streak tracking ─────────────────────────────────────────────────
+    private static int _currentStreak = 0;   // positive = win streak, negative = lose streak
+    private static readonly object _streakLock = new object();
+
+    // ── QoL: session upgrade counter ─────────────────────────────────────────
+    // How many upgrades this run were shared TO this player (won rolls only)
+    private static int _sessionUpgradesReceived = 0;
+    private static int _sessionRollsTotal = 0;
+    private static readonly object _sessionLock = new object();
 
     // THREAD-SAFETY FIX: Make locks INTERNAL so UpgradeReapplyRunner can access them
     internal static readonly object SharedUpgradesLock = new object();
@@ -110,6 +134,12 @@ public class Plugin : BaseUnityPlugin
         UnityEngine.Object.DontDestroyOnLoad(updateRunner);
         updateRunner.hideFlags = HideFlags.HideAndDontSave;
 
+        // Create the Minecraft-style toast notification system
+        var toastObj = new GameObject("LuckyUpgrades_ToastUI");
+        toastObj.AddComponent<UpgradeToastUI>();
+        UnityEngine.Object.DontDestroyOnLoad(toastObj);
+        toastObj.hideFlags = HideFlags.HideAndDontSave;
+
         // Eagerly bind config entries for every upgrade already registered in REPOLib
         // so they appear in the .cfg file from the very first launch and survive restarts.
         PreBindREPOLibUpgrades();
@@ -194,7 +224,10 @@ public class Plugin : BaseUnityPlugin
 
         Logger?.LogInfo($"[LuckyUpgrades] → TriggerModdedUpgradeShare called: '{upgradeId}' from {sourceSteamID}");
 
-        ApplySharedUpgradeToSelf(upgradeId, sourceSteamID, amount,
+        // Resolve display name for the picker
+        string sourcePlayerName = GetPlayerName(sourceSteamID);
+
+        ApplySharedUpgradeToSelf(upgradeId, sourceSteamID, sourcePlayerName, amount,
             applyToSelf: (amt) =>
             {
                 string myID = GetMySteamID();
@@ -374,13 +407,8 @@ public class Plugin : BaseUnityPlugin
         {
             // Re-entrancy guard: skip if the upgrade we're about to fire was
             // triggered by LuckyUpgrades itself (shared-upgrade apply or reapply).
-            // CompareExchange(ref x, 0, 0) is used as a thread-safe volatile read —
-            // it never writes because comparand == newValue, but it does emit the
-            // required memory barrier.  Equivalent to Volatile.Read(ref _isApplyingSharedUpgrade).
             if (Interlocked.CompareExchange(ref _isApplyingSharedUpgrade, 0, 0) == 1)
-            {
                 return;
-            }
 
             string mySteamID = GetMySteamID();
 
@@ -388,17 +416,44 @@ public class Plugin : BaseUnityPlugin
             string upgradeType = GetUpgradeType(__instance);
             if (string.IsNullOrEmpty(upgradeType)) return;
 
-            // Get source SteamID
+            // Get source SteamID and resolve their display name
             string sourceSteamID = GetSteamIDFromItem(__instance);
             if (string.IsNullOrEmpty(sourceSteamID)) return;
             if (string.IsNullOrEmpty(mySteamID)) return;
 
-            // Skip if this player picked up the upgrade themselves
-            if (mySteamID == sourceSteamID) return;
+            // ── QoL: per-instance cooldown ───────────────────────────────────
+            // Key = the specific item's instance ID, so picking up two Health upgrades
+            // back-to-back always fires two independent rolls. Only the exact same
+            // GameObject re-triggering within the cooldown window is suppressed.
+            float cooldown = UpgradeConfiguration?.UpgradeCooldownSeconds.Value ?? 1.5f;
+            if (cooldown > 0f)
+            {
+                int instanceId = __instance.gameObject.GetInstanceID();
+                float now = Time.realtimeSinceStartup;
+                lock (_cooldownLock)
+                {
+                    if (_lastTriggerTime.TryGetValue(instanceId, out float last) && (now - last) < cooldown)
+                    {
+                        Logger.LogInfo($"[LuckyUpgrades] Instance cooldown active for '{upgradeType}' (id:{instanceId}) — skipping ({now - last:F2}s < {cooldown}s)");
+                        return;
+                    }
+                    _lastTriggerTime[instanceId] = now;
+                }
+            }
+
+            // ── QoL: picker toast ─────────────────────────────────────────────
+            // Show a toast to the player who picked up the upgrade so they know sharing is happening
+            if (mySteamID == sourceSteamID)
+            {
+                if (UpgradeConfiguration?.ShowPickerToast.Value ?? true)
+                    UpgradeToastUI.ShowPickerToast(upgradeType);
+                return; // pickers never roll for themselves
+            }
+
+            // Resolve source player display name for the roll toast
+            string sourcePlayerName = GetPlayerName(sourceSteamID);
 
             // Look up the chance from the registry for REPOLib/modded upgrades
-            // so we use the current config value rather than falling through to
-            // GetShareChance which only knows about the 13 built-in upgrade keys.
             int? chanceOverride = null;
             lock (ModdedUpgradeRegistryLock)
             {
@@ -406,7 +461,7 @@ public class Plugin : BaseUnityPlugin
                     chanceOverride = registryEntry.getChance();
             }
 
-            ApplySharedUpgradeToSelf(upgradeType, sourceSteamID, 1,
+            ApplySharedUpgradeToSelf(upgradeType, sourceSteamID, sourcePlayerName, 1,
                 applyToSelf: (_) =>
                 {
                     string myID = GetMySteamID();
@@ -419,6 +474,38 @@ public class Plugin : BaseUnityPlugin
         {
             Logger.LogError($"[LuckyUpgrades] Error in ItemUpgrade_PlayUpgrade_Postfix: {ex.Message}\n{ex.StackTrace}");
         }
+    }
+
+    /// <summary>
+    /// Attempts to get the in-game display name for a player by their SteamID.
+    /// Falls back to a shortened SteamID if the name cannot be resolved.
+    /// </summary>
+    private static string GetPlayerName(string steamID)
+    {
+        if (string.IsNullOrEmpty(steamID)) return "???";
+        try
+        {
+            // Iterate all PlayerAvatar instances and match by SteamID
+            foreach (var avatar in UnityEngine.Object.FindObjectsOfType<PlayerAvatar>())
+            {
+                try
+                {
+                    string id = SemiFunc.PlayerGetSteamID(avatar);
+                    if (id == steamID)
+                    {
+                        string name = SemiFunc.PlayerGetName(avatar);
+                        if (!string.IsNullOrEmpty(name)) return name;
+                    }
+                }
+                catch { /* avatar may not be fully initialised */ }
+            }
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning($"[LuckyUpgrades] GetPlayerName failed: {ex.Message}");
+        }
+        // Fallback: last 6 chars of SteamID so it's still useful
+        return steamID.Length > 6 ? "..." + steamID.Substring(steamID.Length - 6) : steamID;
     }
 
     // Cache for REPOLib type detection.
@@ -845,6 +932,7 @@ public class Plugin : BaseUnityPlugin
     private static void ApplySharedUpgradeToSelf(
         string upgradeType,
         string sourceSteamID,
+        string sourcePlayerName,
         int amount,
         Action<int> applyToSelf,
         int? chanceOverride = null)
@@ -865,6 +953,15 @@ public class Plugin : BaseUnityPlugin
                 bool applied = false;
                 try
                 {
+                    lock (_inFlightLock)
+                    {
+                        if (_inFlightUpgrades.Contains(upgradeType))
+                        {
+                            Logger.LogWarning($"[LuckyUpgrades] Duplicate apply blocked for '{upgradeType}' (in-flight guard) ✗");
+                            return;
+                        }
+                        _inFlightUpgrades.Add(upgradeType);
+                    }
                     Interlocked.Exchange(ref _isApplyingSharedUpgrade, 1);
                     applyToSelf(amount);
                     applied = true;
@@ -872,28 +969,37 @@ public class Plugin : BaseUnityPlugin
                 finally
                 {
                     Interlocked.Exchange(ref _isApplyingSharedUpgrade, 0);
+                    lock (_inFlightLock) { _inFlightUpgrades.Remove(upgradeType); }
                 }
-                // Only track after the guard is released and only if apply succeeded.
                 if (applied)
                 {
                     TrackSharedUpgrade(upgradeType, amount);
+                    UpdateStreakAndSession(won: true);
                     Logger.LogInfo($"[LuckyUpgrades] Shared upgrade applied: {upgradeType} +{amount} (100% guaranteed) ✓");
+                    int streak = GetStreak();
+                    UpgradeToastUI.ShowToast(upgradeType, won: true, sourcePlayerName, streak);
                 }
                 return;
             }
 
-            // For normal probabilistic roll (0-99% range)
+            // Probabilistic roll
             int roll;
-            lock (_randomLock)
-            {
-                roll = _random.Next(100);
-            }
+            lock (_randomLock) { roll = _random.Next(100); }
 
             if (roll < shareChance)
             {
                 bool applied = false;
                 try
                 {
+                    lock (_inFlightLock)
+                    {
+                        if (_inFlightUpgrades.Contains(upgradeType))
+                        {
+                            Logger.LogWarning($"[LuckyUpgrades] Duplicate apply blocked for '{upgradeType}' (in-flight guard) ✗");
+                            return;
+                        }
+                        _inFlightUpgrades.Add(upgradeType);
+                    }
                     Interlocked.Exchange(ref _isApplyingSharedUpgrade, 1);
                     applyToSelf(amount);
                     applied = true;
@@ -901,23 +1007,64 @@ public class Plugin : BaseUnityPlugin
                 finally
                 {
                     Interlocked.Exchange(ref _isApplyingSharedUpgrade, 0);
+                    lock (_inFlightLock) { _inFlightUpgrades.Remove(upgradeType); }
                 }
-                // Only track after the guard is released and only if apply succeeded.
                 if (applied)
                 {
                     TrackSharedUpgrade(upgradeType, amount);
+                    UpdateStreakAndSession(won: true);
                     Logger.LogInfo($"[LuckyUpgrades] Shared upgrade applied: {upgradeType} +{amount} (rolled: {roll} | chance: {shareChance}%) ✓");
+                    int streak = GetStreak();
+                    UpgradeToastUI.ShowToast(upgradeType, won: true, sourcePlayerName, streak);
                 }
             }
             else
             {
+                UpdateStreakAndSession(won: false);
                 Logger.LogInfo($"[LuckyUpgrades] Shared upgrade missed: {upgradeType} (rolled: {roll} | chance: {shareChance}%) ✗");
+                int streak = GetStreak();
+                UpgradeToastUI.ShowToast(upgradeType, won: false, sourcePlayerName, streak);
             }
         }
         catch (Exception ex)
         {
             Logger.LogError($"[LuckyUpgrades] Error in ApplySharedUpgradeToSelf: {ex.Message}\n{ex.StackTrace}");
         }
+    }
+
+    // ── Streak + session helpers ──────────────────────────────────────────────
+
+    private static void UpdateStreakAndSession(bool won)
+    {
+        lock (_streakLock)
+        {
+            if (won)
+                _currentStreak = _currentStreak >= 0 ? _currentStreak + 1 : 1;
+            else
+                _currentStreak = _currentStreak <= 0 ? _currentStreak - 1 : -1;
+        }
+        lock (_sessionLock)
+        {
+            _sessionRollsTotal++;
+            if (won) _sessionUpgradesReceived++;
+        }
+    }
+
+    private static int GetStreak()
+    {
+        lock (_streakLock) { return _currentStreak; }
+    }
+
+    internal static void ResetSessionStats()
+    {
+        lock (_streakLock)   { _currentStreak = 0; }
+        lock (_sessionLock)  { _sessionUpgradesReceived = 0; _sessionRollsTotal = 0; }
+        lock (_cooldownLock) { _lastTriggerTime.Clear(); }
+    }
+
+    internal static (int received, int total) GetSessionStats()
+    {
+        lock (_sessionLock) { return (_sessionUpgradesReceived, _sessionRollsTotal); }
     }
 }
 
@@ -983,16 +1130,20 @@ public class UpgradeReapplyRunner : MonoBehaviour
 
             if (IsSessionEndLevel(currentLevel))
             {
+                // ── QoL: session summary toast ────────────────────────────────
+                var (received, total) = Plugin.GetSessionStats();
+                if (total > 0 && (Plugin.UpgradeConfiguration?.ShowSessionSummary.Value ?? true))
+                    UpgradeToastUI.ShowSessionSummary(received, total);
+
                 lock (Plugin.SharedUpgradesLock)
                 {
                     Plugin._sharedUpgrades.Clear();
                 }
-                // Reset under lock to prevent a data race with GetMySteamID(),
-                // which reads _mySteamID inside MySteamIDLock.
                 lock (Plugin.MySteamIDLock)
                 {
                     Plugin._mySteamID = null;
                 }
+                Plugin.ResetSessionStats();
                 Plugin.Logger.LogInfo("[LuckyUpgrades] Session ended. All tracked data cleared.");
                 return;
             }
@@ -1045,5 +1196,559 @@ public class UpgradeReapplyRunner : MonoBehaviour
                 Plugin.ReapplySharedUpgrades();
             }
         }
+    }
+}
+
+// =============================================================================
+// R.E.P.O. upgrade notification toast — bottom-right corner
+// =============================================================================
+
+/// <summary>
+/// Renders R.E.P.O.-flavoured upgrade share notifications in the bottom-right corner.
+///
+/// Visual anatomy (per toast, 300 × 100 px):
+///   ┌─[5px accent]──────────────────────────────────────────┐
+///   │ LUCKY UPGRADES                              [WIN/MISS] │  ← 22px header strip
+///   ├────────────────────────────────────────────────────────┤
+///   │ [32×32 icon]  UPGRADE NAME                            │  ← upgrade body (54px)
+///   │               + UPGRADE SHARED  /  - NOT THIS TIME    │
+///   │ [████████████░░░░░░░░░]  progress bar                 │
+///   └────────────────────────────────────────────────────────┘
+///
+/// Win accent = #D4A800 (amber-gold)   Miss accent = #8A1A1A (blood red)
+/// Background = #0E0F12 (near-black)   Header font = teal monospace
+/// Scanline overlay drawn as stacked 1px rects (every 4px) for the CRT look.
+/// </summary>
+public class UpgradeToastUI : MonoBehaviour
+{
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+
+    /// <summary>Queue a share-result toast. Thread-safe.</summary>
+    public static void ShowToast(string upgradeType, bool won, string sourcePlayerName = "", int streak = 0)
+    {
+        if (_instance == null) return;
+        var cfg = Plugin.UpgradeConfiguration;
+        if (cfg != null && !cfg.ShowUpgradeNotifications.Value) return;
+        lock (_queue)
+            _queue.Enqueue(new ToastData
+            {
+                upgradeType      = upgradeType,
+                won              = won,
+                sourcePlayerName = sourcePlayerName,
+                streak           = streak,
+                toastKind        = ToastKind.ShareResult,
+            });
+    }
+
+    /// <summary>Show a toast to the player who just picked up the upgrade.</summary>
+    public static void ShowPickerToast(string upgradeType)
+    {
+        if (_instance == null) return;
+        var cfg = Plugin.UpgradeConfiguration;
+        if (cfg != null && !cfg.ShowUpgradeNotifications.Value) return;
+        lock (_queue)
+            _queue.Enqueue(new ToastData
+            {
+                upgradeType = upgradeType,
+                won         = true,
+                toastKind   = ToastKind.Picker,
+            });
+    }
+
+    /// <summary>Show the end-of-run session summary.</summary>
+    public static void ShowSessionSummary(int received, int total)
+    {
+        if (_instance == null) return;
+        var cfg = Plugin.UpgradeConfiguration;
+        if (cfg != null && !cfg.ShowUpgradeNotifications.Value) return;
+        lock (_queue)
+            _queue.Enqueue(new ToastData
+            {
+                toastKind       = ToastKind.SessionSummary,
+                sessionReceived = received,
+                sessionTotal    = total,
+                won             = received > 0,
+            });
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal types
+    // -----------------------------------------------------------------------
+
+    private enum ToastKind { ShareResult, Picker, SessionSummary }
+
+    private struct ToastData
+    {
+        public string    upgradeType;
+        public bool      won;
+        public string    sourcePlayerName;
+        public int       streak;
+        public ToastKind toastKind;
+        public int       sessionReceived;
+        public int       sessionTotal;
+    }
+
+    private class ActiveToast
+    {
+        public string    upgradeType;
+        public bool      won;
+        public string    sourcePlayerName;
+        public int       streak;
+        public ToastKind toastKind;
+        public int       sessionReceived;
+        public int       sessionTotal;
+        public float     holdDuration;
+        public float     elapsed;
+    }
+
+    // -----------------------------------------------------------------------
+    // Design constants
+    // -----------------------------------------------------------------------
+
+    private const float W              = 300f;
+    private const float H              = 115f;
+    private const float HEADER_H       = 22f;
+    private const float ACCENT_W       = 5f;
+    private const float ICON_SIZE      = 32f;
+    private const float ICON_MARGIN    = 10f;
+    private const float BAR_H          = 3f;
+    private const float MARGIN_RIGHT   = 20f;
+    private const float MARGIN_BOTTOM  = 80f;
+    private const float STACK_GAP      = 6f;
+    private const float SLIDE_DUR      = 0.20f;
+    private const float FADE_DUR       = 0.45f;
+
+    // Accent colours — vivid enough to read clearly during gameplay
+    private static readonly Color WIN_ACCENT  = new Color(1.00f, 0.82f, 0.00f, 1f); // bright gold
+    private static readonly Color LOSE_ACCENT = new Color(0.90f, 0.18f, 0.18f, 1f); // vivid red
+    private static readonly Color BG_DARK     = new Color(0.055f, 0.059f, 0.071f, 0.97f);
+    private static readonly Color HEADER_BG   = new Color(1f, 1f, 1f, 0.03f);
+    private static readonly Color TEAL_HEADER = new Color(0.20f, 0.78f, 0.68f, 1f); // bright teal
+    private static readonly Color TEXT_MAIN   = new Color(0.96f, 0.96f, 0.92f, 1f); // near-white
+    private static readonly Color TEXT_DIM    = new Color(1f, 1f, 1f, 0.30f);
+    private static readonly Color BORDER_DIM  = new Color(1f, 1f, 1f, 0.08f);
+    private static readonly Color WIN_TEXT    = new Color(1.00f, 0.90f, 0.20f, 1f); // bright amber
+    private static readonly Color LOSE_TEXT   = new Color(1.00f, 0.38f, 0.38f, 1f); // bright red
+
+    // -----------------------------------------------------------------------
+    // Upgrade labels
+    // -----------------------------------------------------------------------
+
+    private static readonly Dictionary<string, string> Labels = new Dictionary<string, string>
+    {
+        { "Health",          "HEALTH"           },
+        { "Energy",          "ENERGY"           },
+        { "SprintSpeed",     "SPRINT SPEED"     },
+        { "ExtraJump",       "EXTRA JUMP"       },
+        { "TumbleLaunch",    "TUMBLE LAUNCH"    },
+        { "TumbleClimb",     "TUMBLE CLIMB"     },
+        { "TumbleWings",     "TUMBLE WINGS"     },
+        { "CrouchRest",      "CROUCH REST"      },
+        { "GrabRange",       "GRAB RANGE"       },
+        { "GrabStrength",    "GRAB STRENGTH"    },
+        { "GrabThrow",       "GRAB THROW"       },
+        { "MapPlayerCount",  "MAP PLAYER COUNT" },
+        { "DeathHeadBattery","DEATH HEAD BATT." },
+    };
+
+    // -----------------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------------
+
+    private static UpgradeToastUI       _instance;
+    private static readonly Queue<ToastData>  _queue  = new Queue<ToastData>();
+    private readonly        List<ActiveToast> _active = new List<ActiveToast>();
+
+    // Solid-colour textures (all 1×1, tinted via GUI.color)
+    private Texture2D _texWhite;
+    // Scanline strip: 1×4 repeating, rows 0-2 transparent, row 3 8% dark
+    private Texture2D _texScanline;
+
+    // GUIStyles — initialised once on first OnGUI call
+    private GUIStyle _stHeader;    // "LUCKY UPGRADES"   10px bold teal
+    private GUIStyle _stBadge;     // "WIN" / "MISS"     9px bold
+    private GUIStyle _stIcon;      // icon glyph inside box  16px bold centred
+    private GUIStyle _stName;      // upgrade name       15px bold white
+    private GUIStyle _stResult;    // result line        11px bold
+    private GUIStyle _stFoot;      // bottom label       8px dim
+    private bool     _assetsReady;
+
+    // -----------------------------------------------------------------------
+    // Unity lifecycle
+    // -----------------------------------------------------------------------
+
+    private void Awake()     { _instance = this; }
+    private void OnDestroy() { if (_instance == this) _instance = null; }
+
+    private void Update()
+    {
+        lock (_queue)
+        {
+            while (_queue.Count > 0)
+            {
+                var d    = _queue.Dequeue();
+                float hd = d.toastKind == ToastKind.SessionSummary
+                    ? (Plugin.UpgradeConfiguration?.NotificationDisplayTime.Value ?? 3f) + 1.5f  // summaries linger longer
+                    : Plugin.UpgradeConfiguration?.NotificationDisplayTime.Value ?? 3f;
+                _active.Add(new ActiveToast
+                {
+                    upgradeType      = d.upgradeType,
+                    won              = d.won,
+                    sourcePlayerName = d.sourcePlayerName ?? "",
+                    streak           = d.streak,
+                    toastKind        = d.toastKind,
+                    sessionReceived  = d.sessionReceived,
+                    sessionTotal     = d.sessionTotal,
+                    holdDuration     = hd,
+                    elapsed          = 0f,
+                });
+            }
+        }
+
+        float dt = Time.unscaledDeltaTime;
+        for (int i = _active.Count - 1; i >= 0; i--)
+        {
+            _active[i].elapsed += dt;
+            if (_active[i].elapsed >= _active[i].holdDuration + FADE_DUR)
+                _active.RemoveAt(i);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Rendering
+    // -----------------------------------------------------------------------
+
+    private void OnGUI()
+    {
+        if (_active.Count == 0) return;
+        EnsureAssets();
+
+        float sw = Screen.width;
+        float sh = Screen.height;
+
+        for (int i = 0; i < _active.Count; i++)
+        {
+            var t = _active[i];
+
+            // Newest (i=0) sits lowest; older toasts stack upward
+            float baseX = sw - MARGIN_RIGHT - W;
+            float baseY = sh - MARGIN_BOTTOM - H - i * (H + STACK_GAP);
+
+            // Slide in from the right (ease-out cubic)
+            float slideT  = Mathf.Clamp01(t.elapsed / SLIDE_DUR);
+            float eased   = 1f - Mathf.Pow(1f - slideT, 3f);
+            float slideX  = Mathf.Lerp(W + MARGIN_RIGHT, 0f, eased);
+
+            float x = baseX + slideX;
+            float y = baseY;
+
+            // Fade out
+            float alpha = 1f;
+            if (t.elapsed > t.holdDuration)
+                alpha = 1f - Mathf.Clamp01((t.elapsed - t.holdDuration) / FADE_DUR);
+
+            DrawToast(x, y, t, alpha);
+        }
+
+        GUI.color = Color.white;
+    }
+
+    // -----------------------------------------------------------------------
+    // DrawToast — every pixel placed explicitly
+    // -----------------------------------------------------------------------
+
+    private void DrawToast(float x, float y, ActiveToast t, float a)
+    {
+        switch (t.toastKind)
+        {
+            case ToastKind.Picker:          DrawPickerToast(x, y, t, a);   break;
+            case ToastKind.SessionSummary:  DrawSummaryToast(x, y, t, a);  break;
+            default:                        DrawShareResultToast(x, y, t, a); break;
+        }
+    }
+
+    // ── Share result toast (win / miss) ───────────────────────────────────────
+    private void DrawShareResultToast(float x, float y, ActiveToast t, float a)
+    {
+        Color accent = t.won ? WIN_ACCENT : LOSE_ACCENT;
+        Color Aa(Color c) => new Color(c.r, c.g, c.b, c.a * a);
+
+        // Panel + chrome
+        DrawPanel(x, y, W, H, accent, a);
+
+        // WIN/MISS badge
+        DrawBadge(x, y, t.won ? "WIN" : "MISS", accent, a);
+
+        // Header
+        _stHeader.normal.textColor = Aa(TEAL_HEADER);
+        GUI.Label(new Rect(x + ACCENT_W + 7f, y + 1f, W - ACCENT_W - 48f, HEADER_H), "LUCKY UPGRADES", _stHeader);
+
+        // Icon box
+        float iconX = x + ACCENT_W + ICON_MARGIN;
+        float iconY = y + HEADER_H + 8f;
+        DrawIconBox(iconX, iconY, t.won ? "+" : "x", accent, a);
+
+        // Upgrade name
+        float textX = iconX + ICON_SIZE + 8f;
+        float textW = x + W - 8f - textX;
+        string label = Labels.TryGetValue(t.upgradeType, out var lb) ? lb : t.upgradeType.ToUpperInvariant();
+        _stName.normal.textColor = Aa(TEXT_MAIN);
+        GUI.Label(new Rect(textX, iconY - 1f, textW, 22f), label, _stName);
+
+        // Result line
+        _stResult.normal.textColor = t.won ? Aa(WIN_TEXT) : Aa(LOSE_TEXT);
+        GUI.Label(new Rect(textX, iconY + 18f, textW, 16f),
+            t.won ? "+ YOU GOT IT!" : "- NOT THIS TIME", _stResult);
+
+        // Source player name (dim, below result)
+        bool showName = Plugin.UpgradeConfiguration?.ShowSourcePlayerName.Value ?? true;
+        if (showName && !string.IsNullOrEmpty(t.sourcePlayerName))
+        {
+            _stFoot.normal.textColor = Aa(TEXT_DIM);
+            GUI.Label(new Rect(textX, iconY + 36f, textW, 16f),
+                $"from {t.sourcePlayerName}", _stFoot);
+        }
+
+        // Streak (only if ≥2 in a row, config-guarded)
+        bool showStreak = Plugin.UpgradeConfiguration?.ShowStreakCounter.Value ?? true;
+        int absStreak = Math.Abs(t.streak);
+        if (showStreak && absStreak >= 2)
+        {
+            string streakLabel = t.streak > 0
+                ? $"{absStreak} wins in a row!"
+                : $"{absStreak} misses in a row";
+            Color streakCol = t.streak > 0
+                ? new Color(1f, 0.95f, 0.3f, 0.9f * a)
+                : new Color(0.9f, 0.4f, 0.4f, 0.8f * a);
+            _stFoot.normal.textColor = streakCol;
+            float streakY = showName && !string.IsNullOrEmpty(t.sourcePlayerName) ? iconY + 52f : iconY + 36f;
+            GUI.Label(new Rect(textX, streakY, textW, 16f), streakLabel, _stFoot);
+        }
+
+        // Progress bar
+        DrawProgressBar(x, y, t.elapsed, t.holdDuration, accent, a);
+
+        GUI.color = Color.white;
+    }
+
+    // ── Picker toast ("sharing your upgrade!") ────────────────────────────────
+    private void DrawPickerToast(float x, float y, ActiveToast t, float a)
+    {
+        // Picker toast is shorter — use a dimmer teal accent
+        Color accent = new Color(0.20f, 0.78f, 0.68f, 1f);
+        Color Aa(Color c) => new Color(c.r, c.g, c.b, c.a * a);
+
+        DrawPanel(x, y, W, H, accent, a);
+        DrawBadge(x, y, "YOU", accent, a);
+
+        _stHeader.normal.textColor = Aa(TEAL_HEADER);
+        GUI.Label(new Rect(x + ACCENT_W + 7f, y + 1f, W - ACCENT_W - 48f, HEADER_H), "LUCKY UPGRADES", _stHeader);
+
+        float iconX = x + ACCENT_W + ICON_MARGIN;
+        float iconY = y + HEADER_H + 8f;
+        DrawIconBox(iconX, iconY, ">", accent, a);
+
+        float textX = iconX + ICON_SIZE + 8f;
+        float textW = x + W - 8f - textX;
+
+        string label = Labels.TryGetValue(t.upgradeType, out var lb) ? lb : t.upgradeType.ToUpperInvariant();
+        _stName.normal.textColor = Aa(TEXT_MAIN);
+        GUI.Label(new Rect(textX, iconY - 1f, textW, 22f), label, _stName);
+
+        _stResult.normal.textColor = new Color(0.20f, 0.90f, 0.78f, a);
+        GUI.Label(new Rect(textX, iconY + 18f, textW, 16f), "~ SHARING THIS UPGRADE", _stResult);
+
+        _stFoot.normal.textColor = Aa(TEXT_DIM);
+        GUI.Label(new Rect(textX, iconY + 36f, textW, 16f), "teammates are rolling now...", _stFoot);
+
+        DrawProgressBar(x, y, t.elapsed, t.holdDuration, accent, a);
+        GUI.color = Color.white;
+    }
+
+    // ── Session summary toast ─────────────────────────────────────────────────
+    private void DrawSummaryToast(float x, float y, ActiveToast t, float a)
+    {
+        Color accent = t.sessionReceived > 0 ? WIN_ACCENT : LOSE_ACCENT;
+        Color Aa(Color c) => new Color(c.r, c.g, c.b, c.a * a);
+
+        DrawPanel(x, y, W, H, accent, a);
+        DrawBadge(x, y, "RUN", accent, a);
+
+        _stHeader.normal.textColor = Aa(TEAL_HEADER);
+        GUI.Label(new Rect(x + ACCENT_W + 7f, y + 1f, W - ACCENT_W - 48f, HEADER_H), "LUCKY UPGRADES", _stHeader);
+
+        float iconX = x + ACCENT_W + ICON_MARGIN;
+        float iconY = y + HEADER_H + 8f;
+        DrawIconBox(iconX, iconY, "#", accent, a);
+
+        float textX = iconX + ICON_SIZE + 8f;
+        float textW = x + W - 8f - textX;
+
+        _stName.normal.textColor = Aa(TEXT_MAIN);
+        GUI.Label(new Rect(textX, iconY - 1f, textW, 22f), "RUN COMPLETE", _stName);
+
+        int pct = t.sessionTotal > 0 ? (t.sessionReceived * 100 / t.sessionTotal) : 0;
+        _stResult.normal.textColor = t.sessionReceived > 0 ? Aa(WIN_TEXT) : Aa(LOSE_TEXT);
+        GUI.Label(new Rect(textX, iconY + 18f, textW, 16f),
+            $"{t.sessionReceived} / {t.sessionTotal} upgrades", _stResult);
+
+        _stFoot.normal.textColor = Aa(TEXT_DIM);
+        GUI.Label(new Rect(textX, iconY + 36f, textW, 16f),
+            $"{pct}% share rate this run", _stFoot);
+
+        DrawProgressBar(x, y, t.elapsed, t.holdDuration, accent, a);
+        GUI.color = Color.white;
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared drawing helpers — used by all three toast types
+    // -----------------------------------------------------------------------
+
+    private void DrawPanel(float x, float y, float w, float h, Color accent, float a)
+    {
+        Color Aa(Color c) => new Color(c.r, c.g, c.b, c.a * a);
+        Tint(Aa(BG_DARK));     Draw(x, y, w, h);
+        Tint(Aa(accent));      Draw(x, y, ACCENT_W, h);
+        Tint(Aa(HEADER_BG));   Draw(x + ACCENT_W, y, w - ACCENT_W, HEADER_H);
+        Tint(new Color(accent.r, accent.g, accent.b, 0.55f * a));
+        Draw(x + ACCENT_W, y, w - ACCENT_W, 1f);             // top edge
+        Tint(new Color(accent.r, accent.g, accent.b, 0.22f * a));
+        Draw(x + ACCENT_W, y + HEADER_H, w - ACCENT_W, 1f);  // separator
+        Tint(Aa(BORDER_DIM));
+        Draw(x + ACCENT_W, y + h - 1f, w - ACCENT_W, 1f);    // bottom
+        Draw(x + w - 1f,   y,           1f, h);              // right
+        Tint(Color.white);
+        GUI.DrawTexture(new Rect(x, y, w, h), _texScanline, ScaleMode.ScaleAndCrop);
+    }
+
+    private void DrawBadge(float x, float y, string text, Color accent, float a)
+    {
+        float badgeW = 36f;
+        float badgeX = x + W - badgeW - 6f;
+        Tint(new Color(accent.r, accent.g, accent.b, 0.22f * a));
+        Draw(badgeX, y + 4f, badgeW, 14f);
+        DrawBorder(badgeX, y + 4f, badgeW, 14f, new Color(accent.r, accent.g, accent.b, 0.55f * a));
+        _stBadge.normal.textColor = new Color(accent.r, accent.g, accent.b, a);
+        GUI.Label(new Rect(badgeX, y + 4f, badgeW, 14f), text, _stBadge);
+    }
+
+    private void DrawIconBox(float iconX, float iconY, string glyph, Color accent, float a)
+    {
+        Tint(new Color(accent.r, accent.g, accent.b, 0.15f * a));
+        Draw(iconX, iconY, ICON_SIZE, ICON_SIZE);
+        DrawBorder(iconX, iconY, ICON_SIZE, ICON_SIZE, new Color(accent.r, accent.g, accent.b, 0.55f * a));
+        _stIcon.normal.textColor = new Color(accent.r, accent.g, accent.b, a);
+        GUI.Label(new Rect(iconX, iconY, ICON_SIZE, ICON_SIZE), glyph, _stIcon);
+    }
+
+    private void DrawProgressBar(float x, float y, float elapsed, float hold, Color accent, float a)
+    {
+        float barX   = x + ACCENT_W + ICON_MARGIN;
+        float barY   = y + H - 16f;
+        float barW   = W - ACCENT_W - ICON_MARGIN - 8f;
+        float fillPct = Mathf.Clamp01(1f - (elapsed / hold));
+        Tint(new Color(1f, 1f, 1f, 0.07f * a));
+        Draw(barX, barY, barW, BAR_H);
+        Tint(new Color(accent.r, accent.g, accent.b, 0.55f * a));
+        Draw(barX, barY, barW * fillPct, BAR_H);
+    }
+
+    // -----------------------------------------------------------------------
+    // Low-level drawing helpers (all use _texWhite, coloured via GUI.color)
+    // -----------------------------------------------------------------------
+
+    private void Tint(Color c)                          => GUI.color = c;
+    private void Draw(float x, float y, float w, float h) => GUI.DrawTexture(new Rect(x, y, w, h), _texWhite);
+
+    private void DrawBorder(float x, float y, float w, float h, Color c)
+    {
+        Tint(c);
+        Draw(x, y,         w, 1f);       // top
+        Draw(x, y + h - 1, w, 1f);       // bottom
+        Draw(x, y,         1f, h);       // left
+        Draw(x + w - 1, y, 1f, h);       // right
+    }
+
+    // -----------------------------------------------------------------------
+    // Asset initialisation (lazy, first OnGUI)
+    // -----------------------------------------------------------------------
+
+    private void EnsureAssets()
+    {
+        if (_assetsReady) return;
+        _assetsReady = true;
+
+        _texWhite = MakeSolid(Color.white);
+
+        // 4-row repeating scanline: rows 0-2 transparent, row 3 = 8% dark
+        _texScanline = new Texture2D(1, 4, TextureFormat.RGBA32, false)
+        {
+            filterMode = FilterMode.Point,
+            wrapMode   = TextureWrapMode.Repeat,
+        };
+        _texScanline.SetPixel(0, 0, Color.clear);
+        _texScanline.SetPixel(0, 1, Color.clear);
+        _texScanline.SetPixel(0, 2, Color.clear);
+        _texScanline.SetPixel(0, 3, new Color(0f, 0f, 0f, 0.08f));
+        _texScanline.Apply();
+
+        var lbl = GUI.skin.label;
+
+        _stHeader = new GUIStyle(lbl)
+        {
+            fontSize  = 10,
+            fontStyle = FontStyle.Bold,
+            alignment = TextAnchor.MiddleLeft,
+            wordWrap  = false,
+        };
+        _stBadge = new GUIStyle(lbl)
+        {
+            fontSize  = 9,
+            fontStyle = FontStyle.Bold,
+            alignment = TextAnchor.MiddleCenter,
+            wordWrap  = false,
+        };
+        _stIcon = new GUIStyle(lbl)
+        {
+            fontSize  = 20,
+            fontStyle = FontStyle.Bold,
+            alignment = TextAnchor.MiddleCenter,
+            wordWrap  = false,
+        };
+        _stName = new GUIStyle(lbl)
+        {
+            fontSize  = 14,
+            fontStyle = FontStyle.Bold,
+            alignment = TextAnchor.UpperLeft,
+            wordWrap  = false,
+        };
+        _stResult = new GUIStyle(lbl)
+        {
+            fontSize  = 11,
+            fontStyle = FontStyle.Bold,
+            alignment = TextAnchor.UpperLeft,
+            wordWrap  = false,
+        };
+        _stFoot = new GUIStyle(lbl)
+        {
+            fontSize  = 10,
+            fontStyle = FontStyle.Bold,
+            alignment = TextAnchor.UpperLeft,
+            wordWrap  = false,
+        };
+    }
+
+    private static Texture2D MakeSolid(Color col)
+    {
+        var tex = new Texture2D(1, 1, TextureFormat.RGBA32, false)
+        {
+            filterMode = FilterMode.Point,
+            wrapMode   = TextureWrapMode.Clamp,
+        };
+        tex.SetPixel(0, 0, col);
+        tex.Apply();
+        return tex;
     }
 }
